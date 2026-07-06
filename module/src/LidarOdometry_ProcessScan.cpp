@@ -76,6 +76,33 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
 {
   using namespace std::string_literals;
 
+#ifdef MOLA_KERNEL_VIZ_HAS_METRICS
+  // Reports the total per-scan "onLidar" cost (all nested profiler sections
+  // included) as a live metric. Declared before tle_global so it destructs
+  // right after it, once profiler_ has just recorded the finished "onLidar"
+  // entry for this scan.
+  struct OnLidarTimeMetricReporter
+  {
+    OnLidarTimeMetricReporter(const OnLidarTimeMetricReporter &) = delete;
+    OnLidarTimeMetricReporter & operator=(const OnLidarTimeMetricReporter &) = delete;
+    OnLidarTimeMetricReporter(OnLidarTimeMetricReporter &&) = delete;
+    OnLidarTimeMetricReporter & operator=(OnLidarTimeMetricReporter &&) = delete;
+
+    ~OnLidarTimeMetricReporter()
+    {
+      if (!self->visualizer_) {
+        return;
+      }
+      if (!self->metric_onlidar_time_ms_) {
+        self->metric_onlidar_time_ms_ =
+          self->visualizer_->register_metric("lidar_odom/onLidar_time_ms", "ms");
+      }
+      self->metric_onlidar_time_ms_->push(1000.0 * self->profiler_.getLastTime("onLidar"));
+    }
+    LidarOdometry * self;
+  } onLidarTimeMetricReporter{this};
+#endif
+
   const ProfilerEntry tle_global(profiler_, "onLidar");
 
   // Check if we need to process any pending async request:
@@ -90,8 +117,6 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
   const auto this_obs_tim = obs->timestamp;
 
   auto lckState = mrpt::lockHelper(state_mtx_);
-
-  profiler_.leave("delay_onNewObs_to_process");
 
   // for rate stats:
   state_.append_lidar_stamp(obs->sensorLabel, obs->timestamp, *this);
@@ -108,6 +133,15 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
   // Handle initial localization options:
   if (!state_.initial_localization_done) {
     handleInitialLocalization();
+
+    // Methods that need to converge first (e.g. waiting for IMU samples to
+    // calibrate pitch/roll, or for the state estimator to converge) leave
+    // initial_localization_done as false until then. Do not process this
+    // scan (in particular, do not run ICP nor insert it into the map) until
+    // we actually have a valid initial pose.
+    if (!state_.initial_localization_done) {
+      return;
+    }
   }
 
   if (state_.last_obs_tim_by_label.count(obs->sensorLabel) != 0) {
@@ -478,6 +512,9 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
     // Run ICP
     // -----------------------------------------------------
     ProfilerEntry tle_icp(profiler_, "onLidar.3.run_icp");
+#ifdef MOLA_KERNEL_VIZ_HAS_METRICS
+    const double icp_t0 = mrpt::Clock::nowDouble();
+#endif
 
     mrpt::math::TPose3D current_solution = in.init_guess_local_wrt_global;
     size_t twistCorrectionCount = 0;
@@ -608,6 +645,22 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
     out.goodness = icp_result.quality;
     out.icp_iterations = icp_result.nIterations;
 
+#ifdef MOLA_KERNEL_VIZ_HAS_METRICS
+    // Stream ICP metrics to the visualizer's live plot windows, if any
+    // (mola_viz_imgui "Plots" menu; no-op on the nanogui backend / when
+    // nobody is plotting). Registered lazily since visualizer_ may not be
+    // available on the very first calls. Guarded by the feature macro so
+    // this module still builds against an older mola_kernel.
+    if (visualizer_) {
+      if (!metric_icp_time_ms_) {
+        metric_icp_time_ms_ = visualizer_->register_metric("lidar_odom/icp_time_ms", "ms");
+        metric_icp_goodness_ = visualizer_->register_metric("lidar_odom/icp_goodness", "%");
+      }
+      metric_icp_time_ms_->push(1000.0 * (mrpt::Clock::nowDouble() - icp_t0));
+      metric_icp_goodness_->push(100.0 * out.goodness);
+    }
+#endif
+
     MRPT_LOG_DEBUG_FMT(
       "ICP (kind=%u): goodness=%.02f%% iters=%u pose=%s "
       "termReason=%s pose_cov diagonal sigmas:{%e %e %e [m] %e %e %e [deg]}",
@@ -678,6 +731,20 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
       MRPT_LOG_DEBUG_STREAM("Adaptive threshold: sigma=" << state_.adapt_thres_sigma);
 
     }  // end adaptive threshold
+
+    {
+      thread_local auto MOLA_LO_DEBUG_ICP_QUALITY =
+        mrpt::get_env<bool>("MOLA_LO_DEBUG_ICP_QUALITY", false);
+      if (MOLA_LO_DEBUG_ICP_QUALITY) {
+        printf(
+          "[LidarOdometry] pathStep=%zu timestamp=%s goodness=%.3f minRequired=%.3f "
+          "iters=%u termReason=%s isGood=%d adapt_thres_sigma=%.4f consecutive_bad=%d\n",
+          state_.estimated_trajectory.size(), mrpt::system::dateTimeToString(this_obs_tim).c_str(),
+          out.goodness, params_.min_icp_goodness, out.icp_iterations,
+          mrpt::typemeta::enum2str(icp_result.terminationReason).c_str(), icpIsGood ? 1 : 0,
+          state_.adapt_thres_sigma, state_.consecutive_bad_icps);
+      }
+    }
 
     // Sustained-failure recovery for the adaptive threshold (opt-in).
     // The rule above never updates sigma on a bad ICP, which is correct
@@ -855,12 +922,11 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
   }  // end: yes, we can do ICP
 
   // If this was a bad ICP, and we just started with an empty map, re-start again.
-  // Do NOT restart if a starting map was loaded: that would wipe the loaded map.
+  // Do NOT restart if a starting map was loaded (from start-up config, or via
+  // a runtime map_load() service call): that would wipe the loaded map.
   if (
     !state_.last_icp_was_good && state_.estimated_trajectory.size() == 1 &&
-    params_.local_map_updates.enabled &&
-    params_.local_map_updates.load_existing_local_map.empty() &&
-    params_.simplemap.load_existing_simple_map.empty()) {
+    params_.local_map_updates.enabled && !state_.map_has_been_loaded) {
     // Re-start the local map:
     state_.local_map->clear();
     state_.estimated_trajectory.clear();
@@ -936,9 +1002,23 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
   if (pushToSharedKeyframeMapNow) {
     mola::SharedKeyframeMap::KeyframeInsertRequest req;
     req.timestamp = scan_ref_time;
+    // A DEDICATED source_frame_id, distinct from params_.publish_reference_frame:
+    // that one is shared by the dense, every-good-ICP-scan fuse_pose() calls (for
+    // short-term prediction), which tie every such scan absolutely to
+    // F(publish_reference_frame). Reusing the same frame here would let the sink's
+    // anchor-once tie collide with that dense, already-present tie on the very
+    // same (relocalization-seeded) first keyframe, which produced a
+    // gtsam::IndeterminantLinearSystemException at startup in practice.
     req.source_frame_id = params_.publish_reference_frame + "_kf";
+    // state_.last_lidar_pose is this instance's own odometry estimate (in its
+    // own, possibly drift-prone frame), exactly as written to the self-built
+    // simplemap: the sink chains it via *relative* motion, not absolute.
     req.pose_in_source = state_.last_lidar_pose;
+    // Enrich the shared keyframe with the same "metadata" comment (bbox + the
+    // local velocity buffer) the self-built simplemap carries, so downstream
+    // consumers can deskew the raw scan with the per-keyframe velocity window:
     req.observations = sf;
+    appendKeyframeMetadataObs(req.observations, scan_ref_time, *observation);
     req.quality = std::clamp(state_.last_icp_quality, 0.0, 1.0);
     pendingKfReq = std::move(req);
     pendingKfSink = state_.shared_keyframe_map_sink;
@@ -1005,11 +1085,11 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
       pendingKfSink->requestInsertKeyframe(*pendingKfReq);
     } catch (const std::exception & e) {
       MRPT_LOG_WARN_STREAM(
-        "pushKeyframeToSharedKeyframeMap failed at t="
+        "shared keyframe map push failed at t="
         << mrpt::system::dateTimeToString(pendingKfReq->timestamp) << ": " << e.what());
     } catch (...) {
       MRPT_LOG_WARN_STREAM(
-        "pushKeyframeToSharedKeyframeMap failed at t="
+        "shared keyframe map push failed at t="
         << mrpt::system::dateTimeToString(pendingKfReq->timestamp) << " (unknown exception)");
     }
   }
@@ -1179,6 +1259,42 @@ mrpt::obs::CSensoryFrame LidarOdometry::collectRawObservations(
   return sf;
 }
 
+void LidarOdometry::appendKeyframeMetadataObs(
+  mrpt::obs::CSensoryFrame & keyframe_obs, const mrpt::Clock::time_point & scan_ref_time,
+  const mp2p_icp::metric_map_t & observation)
+{
+  using namespace std::string_literals;
+
+  auto metadataObs = mrpt::obs::CObservationComment::Create();
+  metadataObs->timestamp = scan_ref_time;
+  metadataObs->sensorLabel = "metadata";
+
+  mrpt::containers::yaml kf_metadata = mrpt::containers::yaml::Map();
+  std::optional<mrpt::math::TBoundingBoxf> bbox;
+  for (const auto & [layerName, layerMap] : observation.layers) {
+    if (bbox) {
+      bbox = bbox->unionWith(layerMap->boundingBox());
+    } else {
+      bbox = layerMap->boundingBox();
+    }
+  }
+  if (bbox) {
+    kf_metadata["frame_bbox_min"] = "'"s + bbox->min.asString() + "'"s;
+    kf_metadata["frame_bbox_max"] = "'"s + bbox->max.asString() + "'"s;
+  }
+
+  // Store local velocity buffer in the KF metadata so it is possible to deskew
+  // the scan later on with precision.
+  kf_metadata["local_velocity_buffer"] = state_.parameter_source.localVelocityBuffer.toYAML();
+
+  // convert yaml to string:
+  std::stringstream ss;
+  ss << kf_metadata;
+  metadataObs->text = ss.str();
+
+  keyframe_obs.insert(metadataObs);
+}
+
 void LidarOdometry::doUpdateSimpleMap(
   const mrpt::obs::CSensoryFrame & sf, const bool distance_enough_sm,
   const mp2p_icp::metric_map_t::Ptr & observation, const mrpt::Clock::time_point & scan_ref_time,
@@ -1234,35 +1350,8 @@ void LidarOdometry::doUpdateSimpleMap(
     ASSERT_(params_.simplemap.add_non_keyframes_too);
   }
 
-  // Add metadata ("comment") observation:
-  auto metadataObs = mrpt::obs::CObservationComment::Create();
-  metadataObs->timestamp = scan_ref_time;
-  metadataObs->sensorLabel = "metadata";
-
-  mrpt::containers::yaml kf_metadata = mrpt::containers::yaml::Map();
-  std::optional<mrpt::math::TBoundingBoxf> bbox;
-  for (const auto & [layerName, layerMap] : observation->layers) {
-    if (bbox) {
-      bbox = bbox->unionWith(layerMap->boundingBox());
-    } else {
-      bbox = layerMap->boundingBox();
-    }
-  }
-  if (bbox) {
-    kf_metadata["frame_bbox_min"] = "'"s + bbox->min.asString() + "'"s;
-    kf_metadata["frame_bbox_max"] = "'"s + bbox->max.asString() + "'"s;
-  }
-
-  // Store local velocity buffer in the KF metadata so it is possible to deskew the scan later on with precision
-  kf_metadata["local_velocity_buffer"] = state_.parameter_source.localVelocityBuffer.toYAML();
-
-  // convert yaml to string:
-  std::stringstream ss;
-  ss << kf_metadata;
-  metadataObs->text = ss.str();
-
-  // insert it:
-  *keyframe_obs += metadataObs;
+  // Add metadata ("comment") observation with bbox + velocity buffer:
+  appendKeyframeMetadataObs(*keyframe_obs, scan_ref_time, *observation);
 
   // Add keyframe to simple map:
   MRPT_LOG_DEBUG_STREAM("New SimpleMap KeyFrame. SF=" << keyframe_obs->size() << " observations.");
@@ -1292,30 +1381,5 @@ void LidarOdometry::doUpdateSimpleMap(
   constexpr size_t MAX_SIZE_UNLOAD_QUEUE = 100;
   unloadPastSimplemapObservations(MAX_SIZE_UNLOAD_QUEUE);
 }
-
-#if defined(MOLA_HAS_SHARED_KEYFRAME_MAP_SINK)
-void LidarOdometry::pushKeyframeToSharedKeyframeMap(
-  const mrpt::obs::CSensoryFrame & sf, const mrpt::Clock::time_point & scan_ref_time)
-{
-  mola::SharedKeyframeMap::KeyframeInsertRequest req;
-  req.timestamp = scan_ref_time;
-  // A DEDICATED source_frame_id, distinct from params_.publish_reference_frame:
-  // that one is shared by the dense, every-good-ICP-scan fuse_pose() calls
-  // above (for short-term prediction), which tie every such scan absolutely
-  // to F(publish_reference_frame). Reusing the same frame here would let the
-  // sink's anchor-once tie collide with that dense, already-present tie on
-  // the very same (relocalization-seeded) first keyframe, which produced a
-  // gtsam::IndeterminantLinearSystemException at startup in practice.
-  req.source_frame_id = params_.publish_reference_frame + "_kf";
-  // state_.last_lidar_pose is this instance's own odometry estimate (in its
-  // own, possibly drift-prone frame), exactly as written to the self-built
-  // simplemap above: the sink chains it via *relative* motion, not absolute.
-  req.pose_in_source = state_.last_lidar_pose;
-  req.observations = sf;
-  req.quality = std::clamp(state_.last_icp_quality, 0.0, 1.0);
-
-  state_.shared_keyframe_map_sink->requestInsertKeyframe(req);
-}
-#endif
 
 }  // namespace mola

@@ -55,6 +55,28 @@ not here -- but two structural changes live in this file:
 `pushKeyframeToSharedKeyframeMap()`'s dedicated frame name, and the
 distance-checker `insert()` gating fix mentioned above.
 
+## Scan enqueue & overload handling (drop stale, keep freshest)
+
+Incoming LiDAR scans reach a single worker thread (`worker_lidar_`) via
+`onNewObservation` -> `sendLidarScanToProcessQueue`
+(`LidarOdometry_SensorCallbacks.cpp`). Two routes:
+
+- **LO (no IMU de-skew):** the scan is ready immediately and goes straight to
+  `submitReadyLidarScanToWorker()`.
+- **LIO (IMU de-skew):** the scan is parked on `worker_lidar_wait_for_imu_list_`
+  until IMU data covering its whole time span has arrived; `onIMUImpl` then
+  submits the now-ready scans via the same `submitReadyLidarScanToWorker()`.
+
+`submitReadyLidarScanToWorker()` implements a **"drop stale, keep freshest"**
+policy against a single pending slot (`worker_lidar_pending_fresh_scan_`): if the
+worker is idle the scan is dispatched at once; if it is busy the scan replaces
+(drops) any older scan waiting in the slot. `onLidar` processes its scan and then
+drains the slot in a loop, so under overload the worker always advances to the
+*newest* available scan instead of grinding through a deep FIFO backlog. This
+keeps end-to-end latency near a single processing period (so the state-estimator
+prediction is queried only a little into the future) for both LO and LIO.
+`params_.max_lidar_queue_before_drop` now only bounds the IMU wait list.
+
 ## Non-repetitive (solid-state) LiDARs (e.g. Livox AVIA)
 
 Spinning LiDARs (Velodyne, Ouster, ...) cover their full FOV every rotation, so
@@ -84,6 +106,31 @@ over multiple frames. Two consequences for pipeline tuning:
 
 See `mola-cli-launchs/lidar_odometry_from_botanicgarden_livox.yaml` for a
 complete example with all three env vars set.
+
+## Environment Variables (Debug/Tracing Flags)
+
+Debug/tracing flags in C++ code use `mrpt::get_env<T>(name, default)` (from
+`<mrpt/core/get_env.h>`), never plain `::getenv`/`std::getenv`. (The
+`MOLA_MIN_NEARBY_POSES_OCCUPIED`-style vars above are a different mechanism:
+they are resolved by `mola_yaml`'s `${VAR|default}` expansion inside the
+pipeline YAML, not read directly in C++.)
+
+| Variable | Type | Default | Location | Purpose |
+|----------|------|---------|----------|---------|
+| `MOLA_DEBUG_DUMP_ICP_LOG_FROM_TIMESTAMP` | double | 0 | `module/src/LidarOdometry_ProcessScan.cpp` | Start of a timestamp range for forcing ICP debug-log dumps (paired with `..._TO_TIMESTAMP`) |
+| `MOLA_DEBUG_DUMP_ICP_LOG_TO_TIMESTAMP` | double | 0 | `module/src/LidarOdometry_ProcessScan.cpp` | End of the timestamp range above |
+| `MOLA_LO_DEBUG_ICP_QUALITY` | bool | false | `module/src/LidarOdometry_ProcessScan.cpp` | Trace ICP quality metrics per scan |
+| `LO_PIPELINE_YAML` | string | (unset) | `test/test_lidar_odometry_rawlog.cpp`, `test/test_lidar_odometry_rosbag2.cpp` | Path to the LO pipeline YAML used by the test |
+| `LO_STATE_ESTIM_YAML` | string | (unset) | same tests | Path to the state-estimator YAML used by the test |
+| `LO_TEST_RAWLOG` | string | (unset) | `test/test_lidar_odometry_rawlog.cpp` | Path to the input rawlog dataset |
+| `LO_TEST_ROSBAG2` | string | (unset) | `test/test_lidar_odometry_rosbag2.cpp` | Path to the input rosbag2 dataset |
+| `LO_TEST_LIDAR_TOPIC` | string | (unset) | `test/test_lidar_odometry_rosbag2.cpp` | LiDAR topic name to read from the rosbag2 |
+| `LO_TEST_GT_TUM` | string | (unset) | both tests above | Path to the ground-truth trajectory (TUM format) |
+
+Plain `getenv()` calls remain only in `module/src/libcfgpath/cfgpath.h`
+(vendored third-party code resolving standard XDG base directories:
+`XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, `HOME`) — these are OS
+path-resolution lookups, not app debug flags, and are left untouched.
 
 ## Building
 
