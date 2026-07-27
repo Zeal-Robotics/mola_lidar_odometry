@@ -5,7 +5,7 @@
 -->
 <package format="3">
   <name>mola_lidar_odometry</name>
-  <version>2.2.1</version>
+  <version>3.0.0</version>
   <description>LIDAR odometry system based on MOLA and MRPT components</description>
 
   <maintainer email="joseluisblancoc@gmail.com">Jose-Luis Blanco-Claraco</maintainer>
@@ -17,6 +17,7 @@
   <!-- core dependencies -->
   <depend>mola_common</depend>
   <depend>mola_kernel</depend>
+  <depend>mola_yaml</depend>
   <depend>mp2p_icp</depend>
   <depend>mola_pose_list</depend>
 

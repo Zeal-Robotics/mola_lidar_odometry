@@ -24,6 +24,7 @@ find_package(mola_common REQUIRED)
 find_package(mrpt-maps REQUIRED)
 find_package(mrpt-tclap REQUIRED)
 find_package(mola_kernel REQUIRED)
+find_package(mola_yaml REQUIRED)
 find_package(mp2p_icp REQUIRED)
 find_package(mp2p_icp_filters REQUIRED)
 find_package(mola_pose_list REQUIRED)
@@ -33,7 +34,7 @@ find_package(mola_imu_preintegration REQUIRED)
 # define lib:
 set(LIB_SRCS
   module/src/GravityMapAligner.cpp
-  module/src/TrajectoryRebaker.cpp
+  module/src/KeyframeDecider.cpp
   module/src/LidarOdometry_Main.cpp
   module/src/LidarOdometry_Relocalization.cpp
   module/src/LidarOdometry_Parameters.cpp
@@ -52,7 +53,6 @@ set(LIB_SRCS
 set(LIB_PUBLIC_HDRS
   module/include/mola_lidar_odometry/LidarOdometry.h
   module/include/mola_lidar_odometry/GravityMapAligner.h
-  module/include/mola_lidar_odometry/TrajectoryRebaker.h
 )
 
 mola_add_library(
@@ -61,6 +61,7 @@ mola_add_library(
   PUBLIC_LINK_LIBRARIES
     mrpt::maps
     mola::mola_kernel
+    mola::mola_yaml
     mola::mp2p_icp
     mola::mp2p_icp_filters
     mola::mola_pose_list
@@ -69,6 +70,7 @@ mola_add_library(
 #  mrpt::maps
   CMAKE_DEPENDENCIES
     mola_kernel
+    mola_yaml
     mp2p_icp
     mp2p_icp_filters
     mrpt-maps
@@ -194,6 +196,9 @@ install(
     scripts/mola-lo-gui-rosbag2
     scripts/mola-lo-gui-rosbag1
     scripts/mola-lo-gui-ouster
+    scripts/mola-lo-gui-conslam
+    scripts/mola-lo-gui-oxford-spires
+    scripts/mola-lo-gui-botanicgarden
   DESTINATION
     bin
 )

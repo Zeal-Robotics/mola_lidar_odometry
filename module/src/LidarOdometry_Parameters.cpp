@@ -122,9 +122,9 @@ void LidarOdometry::Parameters::Visualization::initialize(const Yaml & cfg)
   YAML_LOAD_OPT(current_observation_alpha, float);
   YAML_LOAD_OPT(show_ground_grid, bool);
   YAML_LOAD_OPT(ground_grid_spacing, float);
-  YAML_LOAD_OPT(show_console_messages, bool);
   YAML_LOAD_OPT(current_pose_corner_size, float);
   YAML_LOAD_OPT(sensor_poses_corner_size, float);
+  YAML_LOAD_OPT(show_current_pose_corner, bool);
   YAML_LOAD_OPT(local_map_point_size, float);
   YAML_LOAD_OPT(current_observation_point_size, float);
   YAML_LOAD_OPT(last_deskewed_observations_point_size, float);
@@ -196,19 +196,64 @@ void LidarOdometry::Parameters::Visualization::initializeModelPart(const Yaml & 
   }
 }
 
+void LidarOdometry::Parameters::load_keyframe_policy(
+  mola::KeyframeDecisionOptions & o, const Yaml & cfg, const char * section_name,
+  bool distances_required)
+{
+  // The two distance thresholds may be formulas (e.g. shrinking with angular
+  // velocity), so they are declared as dynamic parameters re-evaluated per
+  // scan, not read once. The DECLARE_PARAMETER_IN_* macros are expanded by
+  // hand here because they derive the YAML key from the variable name, which
+  // does not survive being passed in as a reference.
+  auto declareDistance = [&](const char * key, double & target) {
+    if (distances_required && !cfg.has(key)) {
+      throw std::invalid_argument(
+        mrpt::format("Required parameter `%s.%s` not found in configuration.", section_name, key));
+    }
+    parseAndDeclareParameter(cfg.getOrDefault<std::string>(key, std::to_string(target)), target);
+  };
+
+  declareDistance("min_translation_between_keyframes", o.min_translation_between_keyframes);
+  declareDistance("min_rotation_between_keyframes", o.min_rotation_between_keyframes);
+
+  o.measure_from_last_kf_only =
+    cfg.getOrDefault<bool>("measure_from_last_kf_only", o.measure_from_last_kf_only);
+  o.min_nearby_poses_occupied =
+    cfg.getOrDefault<uint32_t>("min_nearby_poses_occupied", o.min_nearby_poses_occupied);
+  o.nearby_keyframe_time_window =
+    cfg.getOrDefault<double>("nearby_keyframe_time_window", o.nearby_keyframe_time_window);
+
+  ASSERTMSG_(
+    o.min_nearby_poses_occupied >= 1,
+    mrpt::format(
+      "%s.min_nearby_poses_occupied=%u must be >= 1", section_name,
+      static_cast<unsigned>(o.min_nearby_poses_occupied)));
+
+#if !defined(MOLA_POSE_LIST_HAS_KFM_POSE_PLUMBING)
+  // The spatial policy delegates the occupancy count to
+  // SearchablePoseList::countNearby(), which older mola_pose_list versions do
+  // not have. Reject the combination instead of silently ignoring the option
+  // (the temporal policy does its own counting, so it is unaffected).
+  ASSERTMSG_(
+    o.min_nearby_poses_occupied == 1 || o.nearby_keyframe_time_window > 0,
+    mrpt::format(
+      "%s.min_nearby_poses_occupied>1 requires a newer mola_pose_list, or "
+      "nearby_keyframe_time_window to be enabled",
+      section_name));
+#endif
+
+  ASSERTMSG_(
+    o.nearby_keyframe_time_window >= 0, mrpt::format(
+                                          "%s.nearby_keyframe_time_window=%f must be >= 0",
+                                          section_name, o.nearby_keyframe_time_window));
+}
+
 void LidarOdometry::Parameters::SimpleMapOptions::initialize(const Yaml & cfg, Parameters & parent)
 {
   YAML_LOAD_OPT(generate, bool);
-  DECLARE_PARAMETER_IN_OPT(cfg, min_translation_between_keyframes, parent);
-  DECLARE_PARAMETER_IN_OPT(cfg, min_rotation_between_keyframes, parent);
+  parent.load_keyframe_policy(*this, cfg, "simplemap", false /*distances_required*/);
   YAML_LOAD_OPT(save_final_map_to_file, std::string);
   YAML_LOAD_OPT(add_non_keyframes_too, bool);
-  YAML_LOAD_OPT(measure_from_last_kf_only, bool);
-  YAML_LOAD_OPT(min_nearby_poses_occupied, uint32_t);
-  ASSERTMSG_(
-    min_nearby_poses_occupied >= 1, mrpt::format(
-                                      "simplemap.min_nearby_poses_occupied=%u must be >= 1",
-                                      static_cast<unsigned>(min_nearby_poses_occupied)));
   YAML_LOAD_OPT(generate_lazy_load_scan_files, bool);
   YAML_LOAD_OPT(save_gnss_max_age, double);
   YAML_LOAD_OPT(save_deskewed_scans, bool);
@@ -224,17 +269,10 @@ void LidarOdometry::Parameters::MultipleLidarOptions::initialize(
 void LidarOdometry::Parameters::MapUpdateOptions::initialize(const Yaml & cfg, Parameters & parent)
 {
   YAML_LOAD_OPT(enabled, bool);
-  DECLARE_PARAMETER_IN_REQ(cfg, min_translation_between_keyframes, parent);
-  DECLARE_PARAMETER_IN_REQ(cfg, min_rotation_between_keyframes, parent);
+  parent.load_keyframe_policy(*this, cfg, "local_map_updates", true /*distances_required*/);
   DECLARE_PARAMETER_IN_OPT(cfg, max_distance_to_keep_keyframes, parent);
   DECLARE_PARAMETER_IN_OPT(cfg, check_for_removal_every_n, parent);
   DECLARE_PARAMETER_IN_OPT(cfg, publish_map_updates_every_n, parent);
-  YAML_LOAD_OPT(measure_from_last_kf_only, bool);
-  YAML_LOAD_OPT(min_nearby_poses_occupied, uint32_t);
-  ASSERTMSG_(
-    min_nearby_poses_occupied >= 1, mrpt::format(
-                                      "simplemap.min_nearby_poses_occupied=%u must be >= 1",
-                                      static_cast<unsigned>(min_nearby_poses_occupied)));
   YAML_LOAD_OPT(load_existing_local_map, std::string);
   YAML_LOAD_OPT(save_final_local_map, std::string);
 
@@ -290,6 +328,8 @@ void LidarOdometry::Parameters::ObservationValidityChecks::initialize(const Yaml
 void LidarOdometry::Parameters::IMUGravityCorrection::initialize(const Yaml & cfg)
 {
   YAML_LOAD_OPT(enabled, bool);
+  YAML_LOAD_OPT(use_rank2_prior, bool);
+  YAML_LOAD_OPT(adaptive_sigma, bool);
   YAML_LOAD_OPT(sigma_deg, double);
   YAML_LOAD_OPT(averaging_samples, uint32_t);
   YAML_LOAD_OPT(max_age_seconds, double);
@@ -303,6 +343,34 @@ void LidarOdometry::Parameters::IMUGravityCorrection::initialize(const Yaml & cf
 
     ASSERTMSG_(
       sigma_deg > 0, mrpt::format("imu_gravity_correction.sigma_deg=%.4f must be > 0", sigma_deg));
+  }
+
+  if (cfg.has("map_gravity")) {
+    map_gravity.initialize(cfg["map_gravity"]);
+  }
+}
+
+void LidarOdometry::Parameters::IMUGravityCorrection::MapGravity::initialize(const Yaml & cfg)
+{
+  YAML_LOAD_OPT(enabled, bool);
+  YAML_LOAD_OPT(solve_every_n, uint32_t);
+  ASSERT_(solve_every_n >= 1);
+  YAML_LOAD_OPT(min_interval_seconds, double);
+  ASSERTMSG_(
+    min_interval_seconds > 0,
+    mrpt::format(
+      "imu_gravity_correction.map_gravity.min_interval_seconds=%.4f must be > 0",
+      min_interval_seconds));
+
+  // Everything else is forwarded verbatim to mola::imu::MapGravityEstimator,
+  // so its options do not have to be mirrored here.
+  estimator_params = mrpt::containers::yaml::Map();
+  for (const auto & [k, v] : cfg.asMapRange()) {
+    const auto key = k.as<std::string>();
+    if (key == "enabled" || key == "solve_every_n" || key == "min_interval_seconds") {
+      continue;
+    }
+    estimator_params[key] = v;
   }
 }
 

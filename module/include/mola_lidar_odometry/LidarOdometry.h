@@ -40,13 +40,30 @@
 
 // Other packages:
 #include <mola_imu_preintegration/ImuInitialCalibrator.h>
-#include <mola_pose_list/SearchablePoseList.h>
+#if __has_include(<mola_imu_preintegration/MapGravityEstimator.h>)
+#include <mola_imu_preintegration/MapGravityEstimator.h>
+/** Feature macro: mola_imu_preintegration provides mola::imu::MapGravityEstimator,
+ *  used here to estimate the gravity direction IN THE MAP FRAME instead of
+ *  freezing it from a single accelerometer average at the first keyframe. */
+#define MOLA_LO_HAS_MAP_GRAVITY_ESTIMATOR 1
+#endif
+#include <mola_lidar_odometry/KeyframeDecider.h>
 
 // MP2P_ICP
 #include <mp2p_icp/ICP.h>
 #include <mp2p_icp/Parameterizable.h>
 #include <mp2p_icp_filters/FilterBase.h>
 #include <mp2p_icp_filters/Generator.h>
+
+// The yaw-free, rank-2 gravity prior is only available in recent mp2p_icp
+// versions. Keep building against older ones, falling back at run time to the
+// legacy path that folds tilt into the SE(3) pose prior.
+#if defined(__has_include)
+#if __has_include(<mp2p_icp/GravityPrior.h>)
+#include <mp2p_icp/GravityPrior.h>
+#define MOLA_LO_HAS_MP2P_GRAVITY_PRIOR 1
+#endif
+#endif
 
 // MRPT
 #include <mrpt/containers/circular_buffer.h>
@@ -138,6 +155,20 @@ public:
 
   struct Parameters : public mp2p_icp::Parameterizable
   {
+    /** Loads the keyframe-creation policy shared by the local-map and
+         *  simplemap sections. Lives here, and not in KeyframeDecisionOptions
+         *  itself, because the two distance thresholds may be formulas and
+         *  must register into THIS object's dynamic-parameter pool.
+         *  \param section_name Only used in error messages.
+         *  \param distances_required Whether the two distance thresholds must
+         *         be present in the YAML. Kept per-section for backwards
+         *         compatibility: the local-map section demands them, the
+         *         simplemap one defaults them.
+         */
+    void load_keyframe_policy(
+      mola::KeyframeDecisionOptions & o, const Yaml & cfg, const char * section_name,
+      bool distances_required);
+
     /** List of sensor labels or regex's to be matched to input observations
          *  to be used as raw lidar observations.
          */
@@ -188,29 +219,18 @@ public:
 
     MultipleLidarOptions multiple_lidars;
 
-    struct MapUpdateOptions
+    /** Keyframe-creation policy for the LOCAL METRIC MAP. The distance
+         * thresholds, the occupancy count and the temporal window all come
+         * from mola::KeyframeDecisionOptions, shared with SimpleMapOptions;
+         * they stay plain (non-nested) YAML keys of the `local_map_updates`
+         * section.
+         */
+    struct MapUpdateOptions : public mola::KeyframeDecisionOptions
     {
       /** If set to false, the odometry system can be used as
              * localization-only.
              */
       bool enabled = true;
-
-      /** Minimum Euclidean distance (x,y,z) between keyframes inserted
-             * into the local map [meters]. */
-      double min_translation_between_keyframes = 1.0;
-
-      /** Minimum rotation (in 3D space, yaw, pitch,roll, altogether)
-             * between keyframes inserted into
-             * the local map [in degrees]. */
-      double min_rotation_between_keyframes = 30.0;
-
-      /** If true, distance from the last map update are only considered.
-             * Use if mostly mapping without "closed loops".
-             *
-             *  If false (default), a KD-tree will be used to check the distance
-             * to *all* past map insert poses.
-             */
-      bool measure_from_last_kf_only = false;
 
       /** Should match the "remove farther than" option of the local
              * metric map. 0 means deletion of distant keyframes is disabled.
@@ -222,14 +242,6 @@ public:
              * how often to do the distant keyframes clean up.
              */
       uint32_t check_for_removal_every_n = 100;
-
-      /** Minimum number of stored poses within the threshold distance
-             *  before a volume is considered "occupied" and no new keyframe
-             *  is inserted there. Default=1 gives the classic behavior.
-             *  Increase to 2+ for non-repetitive-scan lidars (e.g. Livox)
-             *  so multiple scans are taken from each location.
-             */
-      uint32_t min_nearby_poses_occupied = 1;
 
       /** Publish updated map via mola::MapSourceBase once every N frames
              */
@@ -277,6 +289,14 @@ public:
       float current_pose_corner_size = 1.5f;  //! [m]
       float sensor_poses_corner_size = 0.5f;  //! [m], 0 to disable
 
+      /** Whether to render the current-pose XYZ corner at all (independently
+             * of current_pose_corner_size). Useful to turn off from a
+             * first-person camera, where the corner ends up filling the whole
+             * view. Can also be changed at runtime via
+             * setCurrentPoseCornerVisualization().
+             */
+      bool show_current_pose_corner = true;
+
       // --- Ground grid ---
       bool show_ground_grid = true;
       float ground_grid_spacing = 5.0f;
@@ -318,7 +338,6 @@ public:
       int map_update_decimation = 10;
 
       bool gui_subwindow_starts_hidden = false;
-      std::atomic<bool> show_console_messages{true};
 
       // --- Tab visibility ---
       bool show_tab_status = true;
@@ -420,26 +439,16 @@ public:
     std::map<AlignKind, ICP_case> icp;
 
     // === SIMPLEMAP GENERATION ====
-    struct SimpleMapOptions
+    /** Keyframe-creation policy for the SIMPLEMAP, which is also the one
+         * pushed to a mola::SharedKeyframeMap sink (the central mapper's
+         * keyframe backbone). Same shared policy as MapUpdateOptions, but
+         * tuned independently: unlike the local map, this one feeds loop
+         * closure, so it is the one that usually wants
+         * `nearby_keyframe_time_window` enabled.
+         */
+    struct SimpleMapOptions : public mola::KeyframeDecisionOptions
     {
       bool generate = false;
-
-      /** Minimum Euclidean distance (x,y,z) between keyframes inserted
-             * into the simplemap [meters]. */
-      double min_translation_between_keyframes = 1.0;
-
-      /** Minimum rotation (in 3D space, yaw, pitch,roll, altogether)
-             * between keyframes inserted into
-             * the map [in degrees]. */
-      double min_rotation_between_keyframes = 30.0;
-
-      /** If true, distance from the last map update are only considered.
-             * Use if mostly mapping without "closed loops".
-             *
-             *  If false (default), a KD-tree will be used to check the distance
-             * to *all* past map insert poses.
-             */
-      bool measure_from_last_kf_only = false;
 
       /** If not empty, the final simple map will be dumped to a file at
              * destruction time */
@@ -471,13 +480,6 @@ public:
 
       /** If enabled, saved keyframes will contain an additional 'deskewed' observation with the motion-compensated cloud. */
       bool save_deskewed_scans = false;
-
-      /** Minimum number of stored poses within the threshold distance
-             *  before a volume is considered "occupied" and no new keyframe
-             *  is inserted there. Default=1 gives the classic behavior.
-             *  Increase to 2+ for non-repetitive-scan lidars (e.g. Livox).
-             */
-      uint32_t min_nearby_poses_occupied = 1;
 
       void initialize(const Yaml & c, Parameters & parent);
     };
@@ -574,11 +576,37 @@ public:
 
     struct IMUGravityCorrection
     {
-      /// Enable accelerometer-based pitch/roll correction in ICP prior.
+      /// Enable accelerometer-based pitch/roll correction of the ICP solution.
       bool enabled = true;
 
-      /// Sigma [degrees] for the gravity-derived pitch/roll prior.
-      /// Lower values = more trust in IMU. Typical: 1–5 deg.
+      /// Apply the verticality constraint as mp2p_icp's yaw-free, rank-2
+      /// `gravityPrior` (recommended) instead of folding the gravity-derived
+      /// pitch/roll into the SE(3) pose prior.
+      ///
+      /// The legacy path (false) encodes tilt in a 6x6 prior information
+      /// matrix, whose diagonal only isolates roll/pitch near yaw=0 and which
+      /// injects translation directly. Kept selectable for reproducibility of
+      /// older results.
+      ///
+      /// Requires an mp2p_icp version providing mp2p_icp::GravityPrior; when
+      /// built against an older one this silently falls back to the legacy
+      /// path (with a warning), it does not fail.
+      bool use_rank2_prior = true;
+
+      /// Widen `sigma_deg` in quadrature by the MEASURED angular dispersion of
+      /// the buffered accelerometer directions, so the constraint stands down
+      /// automatically when the accelerometer is not actually measuring
+      /// gravity.
+      ///
+      /// Needed because the quasi-static acceptance gate alone is far too
+      /// permissive: accepting |norm(a) - g| <= 2 m/s^2 admits up to
+      /// asin(2/9.81) ~= 11.8 deg of aliased tilt. Without this, on a real
+      /// vehicle the gravity constraint asserts tilt information the reading
+      /// does not contain, and odometry gets worse rather than better.
+      bool adaptive_sigma = true;
+
+      /// Sigma [degrees] for the gravity-derived verticality constraint.
+      /// Lower values = more trust in IMU. Typical: 1 to 5 deg.
       double sigma_deg = 2.0;
 
       /// Number of recent accelerometer samples to average for gravity estimation.
@@ -587,6 +615,46 @@ public:
       /// Maximum age [seconds] for accelerometer samples used in averaging.
       /// Samples older than this are discarded. 0 = no age limit.
       double max_age_seconds = 2.0;
+
+      /// Estimate the map-frame gravity direction online, instead of freezing
+      /// it from one accelerometer average at the first keyframe.
+      ///
+      /// The frozen capture is only as good as `averaging_samples` worth of
+      /// accelerometer while the platform is not actually static: measured on
+      /// a handheld sequence, independent 50 ms averages disagree by ~4 deg
+      /// RMS, and whatever value happens to be captured then biases the
+      /// verticality reference for the whole run.
+      ///
+      /// mola::imu::MapGravityEstimator instead solves for gravity in the map
+      /// frame (plus IMU biases) from preintegrated IMU and this odometry's
+      /// own relative attitudes and velocities, so platform acceleration
+      /// cancels and no quasi-static window is needed. Its `up_map` and its
+      /// earned sigma then replace the frozen ones.
+      struct MapGravity
+      {
+        bool enabled = false;
+
+        /// Run a solve() every N closed intervals (a solve is a small
+        /// Gauss-Newton over the window, but not free).
+        uint32_t solve_every_n = 5;
+
+        /// Minimum wall-clock span [s] of one interval. Gravity is recovered as
+        /// (v_to - v_from - R_from*dV)/dt, so a velocity error eps shows up as
+        /// a gravity error eps/dt: closing an interval every scan (dt ~ 0.1 s)
+        /// turns a 0.1 m/s velocity error into ~6 deg of apparent tilt.
+        double min_interval_seconds = 1.0;
+
+        /// Options forwarded verbatim to mola::imu::MapGravityEstimator, so its
+        /// parameters do not have to be mirrored here. Note that its own
+        /// defaults are tuned for a different use: `window_size` in particular
+        /// wants to be much larger here (100+ rather than 20), since the whole
+        /// point is that verticality information accumulates.
+        mrpt::containers::yaml estimator_params;
+
+        void initialize(const Yaml & c);
+      };
+
+      MapGravity map_gravity;
 
       void initialize(const Yaml & c);
     };
@@ -698,6 +766,11 @@ public:
      *  trajectory appearance instead of toggling the scene object externally. */
   void setTrajectoryVisualization(bool show, const std::vector<float> & rgba);
 
+  /** Shows or hides the current-pose XYZ corner opengl object. Useful for a
+     *  host using a first-person camera placed at the vehicle pose, where the
+     *  corner would otherwise fill the whole view. */
+  void setCurrentPoseCornerVisualization(bool show);
+
   /** @} */
 
   /** @name Virtual interface of Relocalization
@@ -767,6 +840,11 @@ private:
 
     mrpt::poses::CPose3D last_keyframe_pose;
     std::optional<mrpt::poses::CPose3DPDFGaussianInf> prior;
+#if defined(MOLA_LO_HAS_MP2P_GRAVITY_PRIOR)
+    /// Yaw-free, rank-2 gravity observation (alternative to folding tilt into
+    /// `prior`; see buildGravityPrior()). Only set when the rank-2 path is on.
+    std::optional<mp2p_icp::GravityPrior> gravityPrior;
+#endif
     id_t global_id = mola::INVALID_ID;
     id_t local_id = mola::INVALID_ID;
     double time_since_last_keyframe = 0;
@@ -841,9 +919,48 @@ private:
       /// max_age_seconds <= 0 means no age filtering.
       std::optional<std::pair<double, double>> estimatedPitchRoll(
         uint32_t required_samples, double max_age_seconds) const;
+
+      /// Empirical 1-sigma [rad] of the gravity DIRECTION over the samples
+      /// currently in the buffer: the RMS angle between each buffered sample's
+      /// direction and their mean direction.
+      ///
+      /// This is the honest uncertainty of the reading, measured rather than
+      /// assumed. While quasi-static it is small; under real vehicle dynamics
+      /// (braking, cornering, vibration) the accepted samples disagree and it
+      /// grows, so a caller that adds it in quadrature to its configured sigma
+      /// gets a verticality constraint that self-silences exactly when the
+      /// quasi-static assumption behind it stops holding.
+      ///
+      /// nullopt if fewer than 2 usable samples.
+      std::optional<double> directionDispersionSigma(double max_age_seconds) const;
     };
 
     GravityEstimator gravity_estimator;
+
+#if defined(MOLA_LO_HAS_MAP_GRAVITY_ESTIMATOR)
+    /// Online estimate of gravity in the MAP frame (plus IMU biases), used to
+    /// replace the one-shot `gravity_calib_pitch_roll` capture when
+    /// `imu_gravity_correction.map_gravity.enabled`.
+    struct MapGravityState
+    {
+      mola::imu::MapGravityEstimator estimator;
+      mola::imu::ImuPreintegrator preintegrator;
+
+      /// Wall-clock stamp of the last IMU sample fed to the preintegrator, to
+      /// derive dt for the next one.
+      std::optional<double> last_imu_time;
+
+      /// Open interval start: stamp, attitude and map-frame velocity captured
+      /// when the previous scan was committed.
+      std::optional<double> open_t_from;
+      mrpt::poses::CPose3D open_R_from;
+      mrpt::math::TVector3D open_v_from{0, 0, 0};
+
+      uint32_t intervals_since_solve = 0;
+    };
+
+    MapGravityState map_gravity;
+#endif
 
     /// Gravity-derived (pitch, roll), in radians, captured at the time the first
     /// keyframe (map origin) was created. The IMU gravity estimator reports
@@ -933,8 +1050,8 @@ private:
 
     // to check for map updates. Defined as optional<> so we enforce
     // setting their type in the ctor:
-    std::optional<SearchablePoseList> distance_checker_local_map;
-    std::optional<SearchablePoseList> distance_checker_simplemap;
+    std::optional<KeyframeDecider> kf_decider_local_map;
+    std::optional<KeyframeDecider> kf_decider_simplemap;
 
     /// See check_for_removal_every_n
     uint32_t localmap_check_removal_counter = 0;
@@ -1045,6 +1162,32 @@ private:
   /// arrival-based period estimate above. Guarded by the wait-list mutex.
   double last_lidar_arrival_stamp_ = 0;
 
+#if defined(MOLA_LO_HAS_MP2P_GRAVITY_PRIOR)
+  /// Builds the yaw-free rank-2 gravity observation for the current scan from
+  /// the accelerometer gravity estimate, expressed against the map-frame
+  /// gravity direction captured at the map origin. nullopt if no reading yet.
+  /// Caller must hold state_mtx_.
+  [[nodiscard]] std::optional<mp2p_icp::GravityPrior> buildGravityPrior() const;
+#endif
+
+  /// The gravity sigma [rad] actually applied this scan: the configured
+  /// `imu_gravity_correction.sigma_deg`, optionally widened by the measured
+  /// direction dispersion (see `adaptive_sigma`). Caller must hold state_mtx_.
+  [[nodiscard]] double effectiveGravitySigmaRad() const;
+
+#if defined(MOLA_LO_HAS_MAP_GRAVITY_ESTIMATOR)
+  /// Feeds one IMU observation into the map-gravity preintegrator, in the
+  /// vehicle frame. Caller must hold state_mtx_.
+  void accumulateImuForMapGravity(const mrpt::obs::CObservationIMU & imu);
+
+  /// Closes the currently open preintegration interval at the just-committed
+  /// scan pose, appends it to the map-gravity estimator, and periodically
+  /// re-solves. Caller must hold state_mtx_.
+  void closeMapGravityInterval(
+    double timestamp, const mrpt::poses::CPose3D & pose, const mrpt::math::TTwist3D & twistLocal);
+
+#endif
+
   /** The worker thread pool with 1 thread for processing incoming observations*/
   mrpt::WorkerThreadsPool worker_others_{
     1 /*num threads*/, mrpt::WorkerThreadsPool::POLICY_FIFO, "worker_imu"};
@@ -1070,6 +1213,7 @@ private:
   MetricChannel::Ptr metric_icp_time_ms_;
   MetricChannel::Ptr metric_icp_goodness_;
   MetricChannel::Ptr metric_onlidar_time_ms_;
+  MetricChannel::Ptr metric_update_local_map_time_ms_;
 #endif
 
   // Accessing this struct in gui_ requires acquiring state_gui_mtx_

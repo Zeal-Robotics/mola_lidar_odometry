@@ -187,12 +187,6 @@ mola::gui::Tab LidarOdometry::buildTabView()
     }});
 
   tab.widgets.emplace_back(CheckBox{
-    "Show log messages", params_.visualization.show_console_messages, [this](bool checked) {
-      this->enqueue_request(
-        [this, checked]() { params_.visualization.show_console_messages = checked; });
-    }});
-
-  tab.widgets.emplace_back(CheckBox{
     "Show gravity-alignment vector", params_.visualization.show_gravity_align_vector,
     [this](bool checked) {
       this->enqueue_request(
@@ -238,9 +232,6 @@ void LidarOdometry::internalBuildGUI()
       const mrpt::Clock::time_point timestamp) {
       using namespace std::string_literals;
 
-      if (!params_.visualization.show_console_messages) {
-        return;
-      }
       if (level < this->getMinLoggingLevel()) {
         return;
       }
@@ -377,6 +368,11 @@ void LidarOdometry::setTrajectoryVisualization(bool show, const std::vector<floa
   });
 }
 
+void LidarOdometry::setCurrentPoseCornerVisualization(bool show)
+{
+  enqueue_request([this, show]() { params_.visualization.show_current_pose_corner = show; });
+}
+
 std::string LidarOdometry::vizParentFrame() const
 {
 #if defined(MOLA_KERNEL_VIZ_HAS_MOVABLE_FRAMES)
@@ -420,7 +416,8 @@ void LidarOdometry::updateVisualization(
   // the parent (MolaViz::update_3d_object deep-reads it on the GUI
   // thread while the lidar worker may keep producing new frames).
   auto glVehicle = mrpt::opengl::CSetOfObjects::Create();
-  if (const auto l = params_.visualization.current_pose_corner_size; l > 0) {
+  if (const auto l = params_.visualization.current_pose_corner_size;
+      params_.visualization.show_current_pose_corner && l > 0) {
     glVehicle->insert(mrpt::opengl::stock_objects::CornerXYZ(l));
   }
   if (const auto l = params_.visualization.sensor_poses_corner_size; l > 0) {
@@ -873,9 +870,12 @@ void LidarOdometry::updateVisualizationTextLabels()
       "Dropped frames: %5.02f%% (avr queue=%4.02f)", getDropStats() * 100.0, averageLidarQueue));
   }
 
+  // The deciders are created lazily on the first processed scan, while the GUI
+  // may refresh before that (or while initial localization is still pending):
   gui_.lbMapStats->set(mrpt::format(
-    "Keyframes: Localmap=%zu, simplemap=%zu", state_.distance_checker_local_map->size(),
-    state_.distance_checker_simplemap->size()));
+    "Keyframes: Localmap=%zu, simplemap=%zu",
+    state_.kf_decider_local_map ? state_.kf_decider_local_map->size() : 0u,
+    state_.kf_decider_simplemap ? state_.kf_decider_simplemap->size() : 0u));
 
   if (state_.last_motion_model_output) {
     const auto & tw = state_.last_motion_model_output->twist;
