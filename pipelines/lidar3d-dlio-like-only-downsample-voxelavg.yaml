@@ -1,4 +1,32 @@
 # =====================================================================================
+# Pipeline: `lidar3d-dlio-like-only-downsample.yaml` (809's axis 2, forward
+# single-stage decimation) with the per-voxel representative point changed
+# from FirstPoint (the default, an arbitrary real point) to VoxelAverage
+# (the centroid). Isolates whether axis 2's drift reduction comes from
+# collapsing the stock cascade's TWO FirstPoint selections (0.15m then
+# 0.10m, each carrying the C-17-measured selection bias) into one, or from
+# something else about the coarser single-stage decimation itself. See
+# ~/plans/809 for axis 2's own result and the hypothesis this tests.
+# =====================================================================================
+
+# =====================================================================================
+# Pipeline: `lidar3d-gicp.yaml`'s (stock) FORWARD single-axis ablation --
+# axis 2 (downsampling) alone flipped to DLIO's single-stage 0.25 m voxel
+# pass feeding both ICP and the map, axes 1 (keyframe/map-update threshold)
+# and 3 (map data structure) left at MOLA-LO's own stock defaults.
+#
+# Complement of `lidar3d-dlio-like-revert-downsample.yaml` (which starts from
+# the full DLIO-like bundle and reverts axis 2 alone): this starts from stock
+# and adds axis 2 alone. The 806 leave-one-out ablation (reverting one axis
+# from the bundle) found all three axes mutually redundant -- this is the
+# still-open complementary experiment 807's R1 calls for: does this ONE axis,
+# added alone to stock, reproduce the drift reduction by itself? See
+# ~/plans/809 for the 3-arm forward result.
+#
+# See `lidar3d-dlio-like.yaml`'s own header for the axis-2 mechanism in full.
+# =====================================================================================
+
+# =====================================================================================
 # Pipeline: GICP (Generalized ICP) with cov-to-cov pairings
 #
 # For paper references, see https://github.com/MOLAorg/mola_lidar_odometry/
@@ -561,39 +589,29 @@ observations_deskew_pass:
       pointcloud_layer_to_remove: ["raw_range_filtered"]
 
 observations_filter_1st_pass:
-  # Filters:
-  #
-  # One filter object will be created for each entry, instancing the given class,
-  # and with the given parameters. Filters are run in definition order on the
-  # input metric_map_t object.
-
   - class_name: mp2p_icp_filters::FilterDecimateAdaptive
     params:
-      name: "FilterDecimateAdaptive (map)"
+      name: "FilterDecimateAdaptive (map+icp, DLIO-like single stage, VoxelAverage)"
       input_pointcloud_layer: "deskewed"
       output_pointcloud_layer: "decimated_for_map"
-      voxel_size: "${MOLA_CLOUD_DECIMATION_VOXEL_SIZE|0.15}" # [m]
-      desired_output_point_count: "${MOLA_DECIMATED_POINTS_MAP|10000}"
-      parallelization_grain_size: 8000 # When TBB is enabled, the grainsize for splitting the input clouds into threads
+      voxel_size: "${MOLA_CLOUD_DECIMATION_VOXEL_SIZE|0.25}" # [m], DLIO's voxel_filter_res
+      desired_output_point_count: "${MOLA_DECIMATED_POINTS_MAP|200000}" # effectively uncapped
+      # Per-voxel centroid (matching PCL's pcl::VoxelGrid, what DLIO's own
+      # voxel_.filter() actually computes) instead of FirstPoint (an
+      # arbitrary real point per voxel, the default everywhere else in this
+      # file's family). Tests whether axis 2's benefit is the cascade of two
+      # FirstPoint selections collapsing to one (bias applied once instead of
+      # twice, see 807's C-17) or genuinely about resolution/single-stage-ness.
+      decimate_method: "${MOLA_CLOUD_DECIMATE_METHOD|DecimateMethod::VoxelAverage}"
+      parallelization_grain_size: 8000
 
-  - class_name: mp2p_icp_filters::FilterDecimateAdaptive
-    params:
-      name: "FilterDecimateAdaptive (icp)"
-      input_pointcloud_layer: "decimated_for_map"
-      output_pointcloud_layer: "decimated_for_icp"
-      voxel_size: "${MOLA_CLOUD_DECIMATION_VOXEL_SIZE|0.10}" # [m]
-      desired_output_point_count: "${MOLA_DECIMATED_POINTS_ICP|3000}"
-      parallelization_grain_size: 8000 # When TBB is enabled, the grainsize for splitting the input clouds into threads
-
-# 2nd pass:
 observations_filter_2nd_pass:
   - class_name: mp2p_icp_filters::FilterMerge
     params:
-      name: "FilterMerge (icp into obs)"
-      input_pointcloud_layer: "decimated_for_icp"
+      name: "FilterMerge (map into obs, same cloud DLIO-style)"
+      input_pointcloud_layer: "decimated_for_map"
       target_layer: "observation"
 
-# final pass:
 observations_filter_final_pass:
   # Remove layers to save memory and log file storage
   - class_name: mp2p_icp_filters::FilterDeleteLayer

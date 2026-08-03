@@ -35,6 +35,8 @@
 #include <mrpt/poses/Lie/SO.h>
 
 #include <algorithm>
+#include <cmath>
+#include <mutex>
 
 namespace mola
 {
@@ -109,11 +111,13 @@ void LidarOdometry::closeMapGravityInterval(
         if (mg.estimator.solve()) {
           const auto & r = *mg.estimator.latest_result();
 
+          // The scan timestamp is logged so the estimate can be joined against
+          // the trajectory and scored offline (see map_gravity.log_only).
           MRPT_LOG_DEBUG_FMT(
-            "MapGravity: g_map=[%.4f %.4f %.4f] tilt=%.3f deg (pitch %.3f+-%.3f, roll "
+            "MapGravity: t=%.6f g_map=[%.4f %.4f %.4f] tilt=%.3f deg (pitch %.3f+-%.3f, roll "
             "%.3f+-%.3f deg) ba=[%.4f %.4f %.4f] bg=[%.5f %.5f %.5f] intervals=%zu",
-            r.gravity_in_map.x, r.gravity_in_map.y, r.gravity_in_map.z, mrpt::RAD2DEG(r.tilt),
-            mrpt::RAD2DEG(r.pitch_correction), mrpt::RAD2DEG(r.pitch_sigma),
+            r.timestamp, r.gravity_in_map.x, r.gravity_in_map.y, r.gravity_in_map.z,
+            mrpt::RAD2DEG(r.tilt), mrpt::RAD2DEG(r.pitch_correction), mrpt::RAD2DEG(r.pitch_sigma),
             mrpt::RAD2DEG(r.roll_correction), mrpt::RAD2DEG(r.roll_sigma), r.bias_acc.x,
             r.bias_acc.y, r.bias_acc.z, r.bias_gyro.x, r.bias_gyro.y, r.bias_gyro.z,
             r.num_intervals);
@@ -170,7 +174,9 @@ std::optional<mp2p_icp::GravityPrior> LidarOdometry::buildGravityPrior() const
   // Preferred source: the online map-frame gravity estimate. It replaces the
   // one-shot capture below, whose error is whatever the accelerometer average
   // happened to be at the first keyframe and which never improves afterwards.
-  if (params_.imu_gravity_correction.map_gravity.enabled) {
+  if (
+    params_.imu_gravity_correction.map_gravity.enabled &&
+    !params_.imu_gravity_correction.map_gravity.log_only) {
     if (const auto & r = state_.map_gravity.estimator.latest_result();
         r.has_value() && r->converged) {
       const auto & gm = r->gravity_in_map;
@@ -190,10 +196,12 @@ std::optional<mp2p_icp::GravityPrior> LidarOdometry::buildGravityPrior() const
   if (!upMapFromEstimator) {
     if (state_.gravity_calib_pitch_roll.has_value()) {
       const auto [pitch0, roll0] = *state_.gravity_calib_pitch_roll;
-      const mrpt::poses::CPose3D R_map_veh0(
-        mrpt::poses::CPose3D(params_.initial_localization.fixed_initial_pose));
-      g.up_map = R_map_veh0.rotateVector(upFrom(pitch0, roll0));
+      // Transport the reading through the pose it was taken at. That pose is
+      // the map origin whenever the capture succeeded on the first scan.
+      g.up_map = state_.gravity_calib_pose->rotateVector(upFrom(pitch0, roll0));
     } else {
+      // No reference yet: assuming the map is level is a guess, not a fact,
+      // and it is wrong by the map's own tilt for as long as it lasts.
       g.up_map = {0, 0, 1};
     }
   }
@@ -203,6 +211,37 @@ std::optional<mp2p_icp::GravityPrior> LidarOdometry::buildGravityPrior() const
   return g;
 }
 #endif
+
+void LidarOdometry::captureMapOriginVerticality(const mrpt::poses::CPose3D & poseAtCapture)
+{
+  // Caller holds state_mtx_.
+  if (!params_.imu_gravity_correction.enabled || state_.gravity_calib_pitch_roll.has_value()) {
+    return;
+  }
+
+  const auto pr = state_.gravity_estimator.estimatedPitchRoll(
+    params_.imu_gravity_correction.averaging_samples,
+    params_.imu_gravity_correction.max_age_seconds);
+  if (!pr.has_value()) {
+    // Expected at the very first scan, where the IMU buffer holds only what
+    // arrived in the last few milliseconds. Retried on the next scan.
+    return;
+  }
+
+  state_.gravity_calib_pitch_roll = pr;
+  state_.gravity_calib_pose = poseAtCapture;
+
+  // This reference decides the map's vertical for the whole run unless
+  // map_gravity takes over, so log what was captured and when: a run whose
+  // tilt behavior is questioned later starts here.
+  const auto [p0, r0] = *pr;
+  MRPT_LOG_INFO_FMT(
+    "Map-origin verticality reference captured from the accelerometer: "
+    "pitch=%.3f roll=%.3f deg (tilt %.3f deg), at pose [%s]",
+    mrpt::RAD2DEG(p0), mrpt::RAD2DEG(r0),
+    mrpt::RAD2DEG(std::acos(std::clamp(std::cos(p0) * std::cos(r0), -1.0, 1.0))),
+    poseAtCapture.asString().c_str());
+}
 
 double LidarOdometry::effectiveGravitySigmaRad() const
 {
@@ -270,7 +309,7 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
   obs->load();
   const auto this_obs_tim = obs->timestamp;
 
-  auto lckState = mrpt::lockHelper(state_mtx_);
+  std::unique_lock<std::mutex> lckState(state_mtx_);
 
   // for rate stats:
   state_.append_lidar_stamp(obs->sensorLabel, obs->timestamp, *this);
@@ -497,11 +536,8 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
     // available yet). This is the calibration offset needed to later
     // re-express absolute IMU tilt readings relative to this (possibly
     // non-level) map frame instead of true vertical:
-    if (params_.imu_gravity_correction.enabled && !state_.gravity_calib_pitch_roll) {
-      state_.gravity_calib_pitch_roll = state_.gravity_estimator.estimatedPitchRoll(
-        params_.imu_gravity_correction.averaging_samples,
-        params_.imu_gravity_correction.max_age_seconds);
-    }
+    captureMapOriginVerticality(
+      mrpt::poses::CPose3D(params_.initial_localization.fixed_initial_pose));
 
     // Define the current robot pose at the origin with minimal uncertainty
     // (cannot be zero).
@@ -630,8 +666,7 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
         if (state_.gravity_calib_pitch_roll.has_value()) {
           const auto [pitch0, roll0] = *state_.gravity_calib_pitch_roll;
 
-          const mrpt::poses::CPose3D R_map_veh0(
-            mrpt::poses::CPose3D(params_.initial_localization.fixed_initial_pose));
+          const mrpt::poses::CPose3D & R_map_veh0 = *state_.gravity_calib_pose;
           const mrpt::poses::CPose3D R_grav_veh0(0, 0, 0, 0, pitch0, roll0);
           const mrpt::poses::CPose3D R_grav_veh_t(0, 0, 0, 0, imu_pitch, imu_roll);
 
@@ -923,6 +958,12 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
       state_.estimated_trajectory.insert(scan_ref_time, state_.last_lidar_pose.mean);
     }
 
+    // Retry the map-origin verticality capture if the first keyframe was too
+    // early for the accelerometer buffer (no-op once captured).
+    if (icpIsGood) {
+      captureMapOriginVerticality(state_.last_lidar_pose.mean);
+    }
+
 #if defined(MOLA_LO_HAS_MAP_GRAVITY_ESTIMATOR)
     // Close the preintegration interval at this newly-committed pose. Only on a
     // good ICP: the estimator trusts the odometry's RELATIVE attitude, so a
@@ -1127,9 +1168,13 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
     !state_.last_icp_was_good && state_.estimated_trajectory.size() == 1 &&
     params_.local_map_updates.enabled && !state_.map_has_been_loaded) {
     // Re-start the local map:
-    state_.local_map->clear();
+    {
+      auto lckMapContents = mrpt::lockHelper(local_map_content_mtx_);
+      state_.local_map->clear();
+    }
     state_.estimated_trajectory.clear();
     state_.gravity_calib_pitch_roll.reset();  // new map origin: recapture at next first KF
+    state_.gravity_calib_pose.reset();
     updateLocalMap = false;
     state_.last_icp_was_good = true;
 
@@ -1139,6 +1184,10 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
   // Should we create a new KF?
   if (updateLocalMap) {
     ProfilerEntry tle2(profiler_, "onLidar.4.update_local_map");
+
+    // The whole block below mutates the local map layers, so it must exclude
+    // a concurrent visualization render (see local_map_content_mtx_ docs):
+    auto lckMapContents = mrpt::lockHelper(local_map_content_mtx_);
 
     // If the local map is empty, create it from this first observation:
     if (state_.local_map->empty()) {
@@ -1182,6 +1231,9 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
     for (const auto & [lyName, lyMap] : observation->layers) {
       state_.local_map->layers.erase(lyName);
     }
+
+    // No more changes to the map contents below:
+    lckMapContents.unlock();
 
     tle3.stop();
 
@@ -1281,12 +1333,12 @@ void LidarOdometry::processLidarScan(const CObservation::ConstPtr & obs)  // NOL
     const ProfilerEntry tle(profiler_, "onLidar.6.updateVisualization");
 
     if (state_.last_icp_was_good) {
-      updateVisualization(observationRawForViz, fullCloudForVizAndPublish);
+      updateVisualization(observationRawForViz, fullCloudForVizAndPublish, lckState);
     } else {
       // On bad ICP: still update the local map display, GUI panel, and text
       // labels. Skipping the full updateVisualization() avoids 3D pose/path
       // updates that would be based on an unreliable ICP result.
-      updateVisualizationAlways();
+      updateVisualizationAlways(lckState);
     }
   }
 

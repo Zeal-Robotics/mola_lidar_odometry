@@ -235,10 +235,17 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
       if (params_.imu_gravity_correction.map_gravity.enabled) {
         state_.map_gravity.estimator.parameters.load_from(
           params_.imu_gravity_correction.map_gravity.estimator_params);
-        MRPT_LOG_INFO(
-          "imu_gravity_correction.map_gravity enabled: the verticality "
-          "reference will be estimated online instead of frozen at the first "
-          "keyframe.");
+        if (params_.imu_gravity_correction.map_gravity.log_only) {
+          MRPT_LOG_INFO(
+            "imu_gravity_correction.map_gravity enabled in LOG-ONLY mode: the "
+            "estimate is computed and logged but does not reach the verticality "
+            "reference, so the trajectory matches that of a disabled run.");
+        } else {
+          MRPT_LOG_INFO(
+            "imu_gravity_correction.map_gravity enabled: the verticality "
+            "reference will be estimated online instead of frozen at the first "
+            "keyframe.");
+        }
       }
 #else
       if (params_.imu_gravity_correction.map_gravity.enabled) {
@@ -521,6 +528,9 @@ void LidarOdometry::doPreloadLocalMap()
       "Loading map from file: '" << params_.local_map_updates.load_existing_local_map << "'...");
 
     auto lckState = mrpt::lockHelper(state_mtx_);
+    // Guards the map contents against a concurrent visualization render,
+    // which runs without state_mtx_ (see local_map_content_mtx_ docs):
+    auto lckMapContents = mrpt::lockHelper(local_map_content_mtx_);
 
     const bool loadOk =
       state_.local_map->load_from_file(params_.local_map_updates.load_existing_local_map);

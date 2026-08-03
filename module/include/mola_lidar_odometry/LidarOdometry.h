@@ -84,6 +84,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <regex>
 #include <string>
 #include <vector>
@@ -644,6 +645,16 @@ public:
         /// turns a 0.1 m/s velocity error into ~6 deg of apparent tilt.
         double min_interval_seconds = 1.0;
 
+        /// Run the estimator and log its result, but do NOT let it influence
+        /// the verticality constraint. The trajectory then comes out identical
+        /// to a run with `enabled: false`, which is what makes the estimate
+        /// scoreable against ground truth: with the feedback loop closed, the
+        /// map frame it is estimating is partly its own doing.
+        ///
+        /// Use this to validate the estimator on a new dataset before trusting
+        /// it, and keep it OFF in production.
+        bool log_only = false;
+
         /// Options forwarded verbatim to mola::imu::MapGravityEstimator, so its
         /// parameters do not have to be mirrored here. Note that its own
         /// defaults are tuned for a different use: `window_size` in particular
@@ -971,6 +982,17 @@ private:
     /// readings relative to the (possibly non-level) map frame.
     std::optional<std::pair<double, double>> gravity_calib_pitch_roll;
 
+    /// Vehicle pose at the instant `gravity_calib_pitch_roll` was captured.
+    /// The capture is attempted at the first keyframe, but the accelerometer
+    /// average is often not available yet there: at the very first scan the
+    /// IMU buffer holds only the few milliseconds that arrived before it, and
+    /// the quasi-static gate rejects most of those on a moving platform. It is
+    /// therefore retried on later scans, and the reading has to be transported
+    /// through the pose it was taken at to still refer to the map frame.
+    /// Equals `fixed_initial_pose` when the first attempt succeeds, which is
+    /// what makes the retry a strict extension of the original behavior.
+    std::optional<mrpt::poses::CPose3D> gravity_calib_pose;
+
     mrpt::poses::CPose3DPDFGaussian last_lidar_pose;  //!< in local map
 
     std::map<std::string, mrpt::Clock::time_point> last_obs_tim_by_label;
@@ -1097,7 +1119,9 @@ private:
     // to the GUI thread directly: each update clones it into a fresh
     // CSetOfObjects wrapper before dispatch.
     mrpt::opengl::CSetOfLines::Ptr glEstimatedPath;
-    int mapUpdateCnt = std::numeric_limits<int>::max();
+    /// Decimation counter for the local map visualization. Saturating (never
+    /// wraps around), so its maximum value means "refresh at the next chance".
+    unsigned int mapUpdateCnt = std::numeric_limits<unsigned int>::max();
 
     // List of old observations to be unload()'ed, to save RAM if:
     // 1) building a simplemap, and
@@ -1175,6 +1199,13 @@ private:
   /// direction dispersion (see `adaptive_sigma`). Caller must hold state_mtx_.
   [[nodiscard]] double effectiveGravitySigmaRad() const;
 
+  /// Captures the map-origin verticality reference from the accelerometer, if
+  /// it has not been captured yet and an average is available. Safe (and
+  /// intended) to call on every scan: it is a no-op once captured.
+  /// `poseAtCapture` is the vehicle pose the reading belongs to, needed to
+  /// express it in the map frame. Caller must hold state_mtx_.
+  void captureMapOriginVerticality(const mrpt::poses::CPose3D & poseAtCapture);
+
 #if defined(MOLA_LO_HAS_MAP_GRAVITY_ESTIMATOR)
   /// Feeds one IMU observation into the map-gravity preintegrator, in the
   /// vehicle frame. Caller must hold state_mtx_.
@@ -1246,6 +1277,15 @@ private:
   mutable std::mutex drop_stats_mtx_;
   mutable std::mutex state_flags_mtx_;
   mutable std::mutex state_mtx_;
+
+  /// Guards the *contents* (layers) of MethodState::local_map.
+  /// Rendering the map is O(map size) and would stall every other user of
+  /// state_mtx_ (dataset reader, IMU worker, executor thread) if done under it,
+  /// so updateVisualizationLocalMap() temporarily releases state_mtx_ and takes
+  /// this one instead. Lock order: a thread that needs both must take
+  /// state_mtx_ first; it must never be held while acquiring state_mtx_.
+  mutable std::mutex local_map_content_mtx_;
+
   mutable std::mutex state_trajectory_mtx_;
   mutable std::recursive_mutex state_simplemap_mtx_;
   mutable std::mutex state_gui_mtx_;
@@ -1301,19 +1341,23 @@ private:
   void updatePipelineTwistVariables(const mrpt::math::TTwist3D & tw);
   void updatePipelineDynamicVariablesRobotPoseOnly();
 
+  /// All these methods read state_, so the caller must own state_mtx_ and pass
+  /// its lock object down: it is momentarily released while rendering the
+  /// local map (see local_map_content_mtx_).
   void updateVisualization(
     const mp2p_icp::metric_map_t & currentObservation,
-    const mrpt::maps::CPointsMap::Ptr & deskewedCloud);
+    const mrpt::maps::CPointsMap::Ptr & deskewedCloud, std::unique_lock<std::mutex> & lckState);
 
   void updateVisualizationInitVehFrame();
   void updateVisualizationCurrentObservation(
     const mp2p_icp::metric_map_t & currentObservation,
     const mrpt::maps::CPointsMap::Ptr & deskewedCloud);
-  void updateVisualizationLocalMap(std::vector<std::function<void()>> & updateTasks);
+  void updateVisualizationLocalMap(
+    std::vector<std::function<void()>> & updateTasks, std::unique_lock<std::mutex> & lckState);
   void updateVisualizationPath(std::vector<std::function<void()>> & updateTasks);
   void updateVisualizationGravityVector(std::vector<std::function<void()>> & updateTasks);
   void updateVisualizationTextLabels();
-  void updateVisualizationAlways();
+  void updateVisualizationAlways(std::unique_lock<std::mutex> & lckState);
 
   void internalBuildGUI();
   mola::gui::Tab buildTabStatus();

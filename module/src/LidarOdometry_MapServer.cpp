@@ -89,10 +89,14 @@ MapServer::ReturnStatus LidarOdometry::map_load_impl(const std::string & path)
   bool mmLoadOk = false;
   {
     auto lckState = mrpt::lockHelper(state_mtx_);
+    // Guards the map contents against a concurrent visualization render,
+    // which runs without state_mtx_ (see local_map_content_mtx_ docs):
+    auto lckMapContents = mrpt::lockHelper(local_map_content_mtx_);
 
     ASSERT_(state_.local_map);
     state_.local_map->clear();
     state_.gravity_calib_pitch_roll.reset();  // new map origin: recapture at next first KF
+    state_.gravity_calib_pose.reset();
 
     // Mark for GUI / publishing even if we fail to load (so the map is shown
     // as empty rather than stale):

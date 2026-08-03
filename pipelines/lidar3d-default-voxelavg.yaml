@@ -7,6 +7,12 @@
 # for use either programmatically calling initialize(), or from a MOLA system
 # launch file. See "mola-cli-launchs/*" examples or the main project docs:
 # =====================================================================================
+#
+# Identical to lidar3d-default.yaml except for one parameter:
+# FilterDecimateAdaptive's decimate_method is VoxelAverage (the per-voxel
+# centroid, matching PCL's pcl::VoxelGrid used by DLIO) instead of the stock
+# default FirstPoint (an arbitrary real point per voxel). See
+# 806_dlio_vs_mola_gravity_benchmark.md's decimation-method arm.
 
 # TODO: Once mola_yaml >=3.0.0 for all ros2 distros, simplify all yaml with $import and common files
 
@@ -575,6 +581,10 @@ observations_filter_1st_pass:
       voxel_size: "${MOLA_CLOUD_DECIMATION_VOXEL_SIZE|0.15}" # [m]
       desired_output_point_count: "${MOLA_DECIMATED_POINTS_MAP|10000}"
       parallelization_grain_size: 8000 # When TBB is enabled, the grainsize for splitting the input clouds into threads
+      # Only change vs. lidar3d-default.yaml: pick each voxel's centroid
+      # (like PCL's pcl::VoxelGrid, used by DLIO) instead of an arbitrary
+      # real point ("FirstPoint", the stock default).
+      decimate_method: "${MOLA_CLOUD_DECIMATE_METHOD|DecimateMethod::VoxelAverage}"
 
   - class_name: mp2p_icp_filters::FilterDecimateAdaptive
     params:
@@ -584,6 +594,7 @@ observations_filter_1st_pass:
       voxel_size: "${MOLA_CLOUD_DECIMATION_VOXEL_SIZE|0.10}" # [m]
       desired_output_point_count: "${MOLA_DECIMATED_POINTS_ICP|3000}"
       parallelization_grain_size: 8000 # When TBB is enabled, the grainsize for splitting the input clouds into threads
+      decimate_method: "${MOLA_CLOUD_DECIMATE_METHOD|DecimateMethod::VoxelAverage}"
 
 # 2nd pass:
 observations_filter_2nd_pass:

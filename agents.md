@@ -8,6 +8,15 @@ This repository provides a LiDAR-Inertial Odometry (LIO) frontend for the MOLA f
 
 Official Docs: https://docs.mola-slam.org/latest/
 
+## `scripts/mola-lo-gui-conslam`: ROS 1 / ROS 2 bag autodetection
+
+Accepts either a ROS 1 bag (`.bag`) or a ROS 2 bag (`.mcap`) as the first
+argument, autodetected from the file extension. `.mcap` selects
+`lidar_odometry_from_rosbag2.yaml` (`MOLA_INPUT_ROSBAG2`); anything else is
+assumed to be a ROS 1 bag and uses `lidar_odometry_from_rosbag1.yaml`
+(`MOLA_INPUT_ROSBAG1`), matching how `mola-lo-gui-rosbag1`/`mola-lo-gui-rosbag2`
+pick their launch file.
+
 ## `ros2-lidar-odometry.launch.py`: `initial_pose` argument
 
 Added because it was missing: `InitLocalization::FixedPose` has always
@@ -156,6 +165,22 @@ sudden ~30-40 deg yaw error that then persisted for the rest of the run,
 instead of a brief quality dip that recovers to the true pose).
 
 
+## Local-map locking: `state_mtx_` vs `local_map_content_mtx_`
+
+Rendering the local map (`updateVisualizationLocalMap()`) is O(map size) and
+must not run under `state_mtx_`, or it stalls the dataset reader, IMU worker
+and executor threads once the map is large. So it releases `state_mtx_` (via
+the caller's `std::unique_lock`, passed down through
+`updateVisualization*()`) and takes the finer-grained `local_map_content_mtx_`
+instead, which every mutation of `state_.local_map` contents (insert, `clear()`,
+`load_from_file()`) must also hold.
+
+Lock order: take `state_mtx_` first, then `local_map_content_mtx_`; never hold
+the latter while acquiring the former. Note the renderer therefore *releases*
+`state_mtx_` before taking the contents mutex, and releases the contents mutex
+before re-acquiring `state_mtx_`.
+
+
 ## Keyframe-creation policy (shared by local map and simplemap)
 
 `mola::KeyframeDecider` + `mola::KeyframeDecisionOptions`
@@ -223,6 +248,27 @@ over multiple frames. Two consequences for pipeline tuning:
 See `mola-cli-launchs/lidar_odometry_from_botanicgarden_livox.yaml` for a
 complete example with all three env vars set.
 
+## `pipelines/lidar3d-gicp-single-filter.yaml` (temporary test variant)
+
+Same as `lidar3d-gicp.yaml`, except that the two chained `FilterDecimateAdaptive`
+stages are replaced by ONE filter emitting both `decimated_for_map` and
+`decimated_for_icp` from a single voxelization pass, via its `outputs`
+parameter. Voxelizing is the dominant cost, so the second stage becomes
+essentially free (~2 ms/scan on a 100k-point cloud).
+
+One parameter does NOT survive the fold, and the fold-back has to reconcile it:
+the chained "icp" stage had its own `voxel_size` (default 0.10), while a single
+filter has only one grid, `${MOLA_CLOUD_DECIMATION_VOXEL_SIZE|0.15}`. So the ICP
+cloud is now sampled from the 0.15 m grid over the full scan rather than from a
+0.10 m grid over the already-decimated map cloud. (Both stages always read that
+same env var, so only the two defaults ever differed.)
+
+It lives in a separate file
+only because `outputs` needs an mp2p_icp newer than the current release; fold it
+back into `lidar3d-gicp.yaml` and delete it once mp2p_icp is re-released. It is
+deliberately NOT wired into `test/CMakeLists.txt`, which must keep building
+against the released mp2p_icp.
+
 ## Selectable local-map class in `pipelines/lidar3d-gicp.yaml`
 
 `${MOLA_LOCALMAP_CLASS|mola::KeyframePointCloudMap}` picks the class used for
@@ -271,6 +317,24 @@ correctness fix but does not improve odometry, because the tilt-to-Z coupling
 lives in the geometry Hessian and is parameterization-invariant. The gain comes
 from `adaptive_sigma`.
 
+The accelerometer supplies `up_body` (a per-scan measurement); the map's own
+vertical `up_map` is a separate question. By default it is FROZEN from one
+accelerometer average at the first keyframe, so whatever error that capture had
+biases verticality for the whole run.
+`imu_gravity_correction.map_gravity.enabled` replaces it with
+`mola::imu::MapGravityEstimator`, which solves for gravity in the map frame from
+preintegrated IMU plus this odometry's own relative attitudes and velocities;
+its earned pitch/roll sigma is added in quadrature to the prior's, so a weak
+estimate silences itself. There is no quality threshold anywhere in that path,
+by design: the library reports every usable estimate with its sigma and the
+weighting decides (see `mola_imu_preintegration/agents.md`).
+
+`map_gravity.log_only` computes and logs the estimate without letting it reach
+the verticality reference, so the trajectory is identical to a disabled run.
+That is the mode to validate the estimator on a new dataset: with the feedback
+loop closed, the map frame being estimated is partly the estimator's own doing,
+and scoring it against ground truth would be self-referential.
+
 ## Reproducible odometry evaluation
 
 Trajectory-to-trajectory comparisons are only meaningful under all of:
@@ -287,6 +351,15 @@ Trajectory-to-trajectory comparisons are only meaningful under all of:
 The smoother also needs `-l <libmola_state_estimation_smoother.so>`; the CLI
 does not load that plugin by default and the class factory otherwise fails with
 "unknown class name".
+
+Always characterize the run-to-run noise floor (the same config twice) before
+believing a difference between two configs, and confirm the estimate covers the
+full ground-truth timespan.
+
+Ready-made rig for Oxford Spires (`StateEstimationSimple`, deterministic):
+`~/lo-gravity-eval/{oxford_env.sh,run_oxford.sh,eval_tum.py,analyze_map_gravity.py}`.
+The bags carry no `/tf`, so the sensor extrinsics must be passed as the fixed
+poses the env script sets, and the sensor labels are the topic names.
 
 ## Environment Variables (Debug/Tracing Flags)
 

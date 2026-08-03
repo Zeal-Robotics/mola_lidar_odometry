@@ -128,8 +128,12 @@ void LidarOdometry::handleInitialLocalization()
         // call): otherwise this would discard a map inherited from a
         // previous mapping session (multisession/multi-robot mapping).
         if (!state_.map_has_been_loaded) {
-          state_.local_map->clear();
+          {
+            auto lckMapContents = mrpt::lockHelper(local_map_content_mtx_);
+            state_.local_map->clear();
+          }
           state_.gravity_calib_pitch_roll.reset();  // new map origin: recapture at next first KF
+          state_.gravity_calib_pose.reset();
           ASSERT_(state_.local_map->empty());
           {
             auto lckSM = mrpt::lockHelper(state_simplemap_mtx_);

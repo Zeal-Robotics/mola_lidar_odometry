@@ -22,7 +22,7 @@ find_package(mola_common REQUIRED)
 
 # find dependencies:
 find_package(mrpt-maps REQUIRED)
-find_package(mrpt-tclap REQUIRED)
+find_package(CLI11 REQUIRED)
 find_package(mola_kernel REQUIRED)
 find_package(mola_yaml REQUIRED)
 find_package(mp2p_icp REQUIRED)
@@ -105,6 +105,7 @@ find_package(mola_input_kitti360_dataset) # optional
 find_package(mola_input_mulran_dataset) # optional
 find_package(mola_input_rawlog) # optional
 find_package(mola_input_rosbag2) # optional
+find_package(mola_input_rosbag1) # optional
 find_package(mola_input_paris_luco_dataset) # optional
 find_package(mola_state_estimation_simple QUIET) # optional
 
@@ -114,8 +115,10 @@ mola_add_executable(
   LINK_LIBRARIES
   ${PROJECT_NAME}
   mrpt::maps
-  mrpt::tclap
+  CLI11::CLI11
 )
+target_compile_definitions(mola-lidar-odometry-cli PRIVATE MOLA_LO_VERSION=\"${MY_VERSION}\")
+
 if(mola_state_estimation_simple_FOUND)
   message(STATUS "mola-lidar-odometry-cli: With mola_state_estimation_simple = YES")
   target_link_libraries(mola-lidar-odometry-cli mola::mola_state_estimation_simple)
@@ -164,6 +167,14 @@ else()
   message(STATUS "mola-lidar-odometry-cli: With rosbag2 = NO")
 endif()
 
+if(mola_input_rosbag1_FOUND)
+  message(STATUS "mola-lidar-odometry-cli: With rosbag1 = YES")
+  target_link_libraries(mola-lidar-odometry-cli mola::mola_input_rosbag1)
+  target_compile_definitions(mola-lidar-odometry-cli PRIVATE HAVE_MOLA_INPUT_ROSBAG1)
+else()
+  message(STATUS "mola-lidar-odometry-cli: With rosbag1 = NO")
+endif()
+
 if(mola_input_paris_luco_dataset_FOUND)
   message(STATUS "mola-lidar-odometry-cli: With paris_luco = YES")
   target_link_libraries(mola-lidar-odometry-cli mola::mola_input_paris_luco_dataset)
@@ -199,6 +210,7 @@ install(
     scripts/mola-lo-gui-conslam
     scripts/mola-lo-gui-oxford-spires
     scripts/mola-lo-gui-botanicgarden
+    scripts/mola-lo-gui-citrusfarm
   DESTINATION
     bin
 )
