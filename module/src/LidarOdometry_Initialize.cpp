@@ -59,6 +59,10 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
 
   {
     auto lckState = mrpt::lockHelper(state_mtx_);
+    // This block builds the generators/pipelines and attaches them to the
+    // parameter source, all of which the sensor-input thread reaches without
+    // state_mtx_ (sensors may already be feeding by now):
+    auto lckImu = mrpt::lockHelper(imu_state_mtx_);
 
     // One-shot deprecation warning for the legacy *_sensor_* names. Aliases
     // are still honored (dynamic variables are double-published; the *_sensor_*
@@ -184,6 +188,7 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
     YAML_LOAD_OPT(params_, start_active, bool);
 
     YAML_LOAD_OPT(params_, max_lidar_queue_before_drop, uint32_t);
+    YAML_LOAD_OPT(params_, max_time_to_wait_for_imu, double);
     YAML_LOAD_OPT(params_, gnss_queue_max_size, uint32_t);
     YAML_LOAD_OPT(params_, min_motion_model_xyz_cov_inv, double);
 
@@ -479,6 +484,22 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
     if (!sinks.empty()) {
       state_.shared_keyframe_map_sink = std::dynamic_pointer_cast<SharedKeyframeMap>(sinks[0]);
       MRPT_LOG_DEBUG("Detected a SharedKeyframeMap sink: will push central-map keyframes to it.");
+    }
+  }
+#endif
+
+#if defined(MOLA_HAS_TRANSFORM_TREE_SOURCE)
+  // Optional: a data source exposing a /tf tree, used only by the (opt-in)
+  // tf-tree visualization. Absent in datasets without /tf, which is fine.
+  {
+    auto srcs = findService<mola::TransformTreeSource>();
+    if (!srcs.empty()) {
+      state_.transform_tree_source = std::dynamic_pointer_cast<TransformTreeSource>(srcs[0]);
+      MRPT_LOG_DEBUG("Detected a TransformTreeSource: /tf tree visualization is available.");
+    } else if (params_.visualization.show_tf_tree) {
+      MRPT_LOG_WARN(
+        "visualization.show_tf_tree is enabled, but no module in this system provides a "
+        "mola::TransformTreeSource: nothing will be drawn.");
     }
   }
 #endif

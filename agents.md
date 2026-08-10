@@ -17,6 +17,64 @@ assumed to be a ROS 1 bag and uses `lidar_odometry_from_rosbag1.yaml`
 (`MOLA_INPUT_ROSBAG1`), matching how `mola-lo-gui-rosbag1`/`mola-lo-gui-rosbag2`
 pick their launch file.
 
+## `lidar_odometry_from_rosbag1.yaml`: up to 3 bags replayed jointly
+
+`rosbag_filename` is a sequence fed from `MOLA_INPUT_ROSBAG1` plus two
+optional slots, `MOLA_INPUT_ROSBAG1_2` / `_3` (empty entries are dropped by
+`Rosbag1Dataset`). Per-topic datasets that ship `/tf`, the IMU or the odometry
+in separate bag files therefore need no launch file of their own.
+
+## `scripts/mola-lo-gui-grandtour`
+
+GrandTour (ANYmal-D + "Boxi" payload) publishes one bag per topic, so the
+wrapper takes a *mission directory* (or its `*_hesai_undist.bag`) and resolves
+its siblings by the `<mission>_<topic>.bag` naming: LiDAR (required), the
+`tf_minimal` and `adis` bags (optional). Notes specific to this dataset:
+
+- The robot body frame is `base`, not `base_link` (`MOLA_TF_BASE_LINK`).
+- Extrinsics come from the dataset's own `/tf_static`
+  (`base -> box_base -> hesai_lidar` / `adis16475_imu`), so no fixed sensor
+  poses are needed when the tf bag is present; without it the LiDAR falls
+  back to a fixed pose at the origin.
+- The LiDAR topic used is the already-undistorted one, so deskewing defaults
+  to `MotionCompensationMethod::None` to avoid over-compensating motion.
+- The /tf tree view is ON by default here (this is a legged robot with a full
+  joint tree, which is the point), skipping the four frames that are not
+  physically on the body: `odom` (world-fixed, published inverted as a child
+  of `base`), `enu_origin` (geodetic, under `cpt7_imu`) and `dlio_odom` /
+  `dlio_map` (the onboard SLAM's frames, under `hesai_lidar`). Everything
+  else in the tree is real hardware, including the total-station `prism`.
+
+## Robot /tf tree visualization (opt-in)
+
+`visualization.show_tf_tree` draws the subtree of coordinate frames below
+`tf_tree_root_frame` (empty = ask the data source for its `base_link` frame),
+which on a legged robot is its joint tree. Off by default; every knob is also
+live in the GUI's "View" tab.
+
+The frames come from `mola::TransformTreeSource`, detected at init via
+`findService<>()` and guarded by `__has_include`
+(`MOLA_HAS_TRANSFORM_TREE_SOURCE`), so this still builds against an older
+`mola_kernel`. The source resolves the poses against the root and does the
+subtree filtering itself (see `mola`'s agents.md); LO only draws.
+
+Snapshots are pulled once per visualization update, at the current scan's
+timestamp, so the joints match the rendered cloud rather than the wall clock.
+The result is drawn at the vehicle pose, since the poses are body-relative.
+
+`tf_tree_exclude_frames` (comma-separated) drops a frame together with its
+subtree. It is needed in practice because datasets publish *inverted* edges:
+GrandTour has `base -> odom` and `hesai_lidar -> dlio_odom`, so without
+excluding them a ~130 m translation drags an unrelated subtree into the
+robot's own tree.
+
+Links (`tf_tree_show_links`) render as thin `CCylinder`s, not GL lines: MRPT
+cannot draw lines with a configurable thickness, so they are barely visible.
+Radius is `tf_tree_link_radius` (`MOLA_LO_TF_TREE_LINK_RADIUS`, default 0.02 m),
+also live in the GUI. Orientation is derived from the two endpoints (pitch =
+`acos(nz)`, yaw = `atan2(ny, nx)` of the unit direction), the same approach
+used for `mola_mapper`'s graph-edge cylinders.
+
 ## `ros2-lidar-odometry.launch.py`: `initial_pose` argument
 
 Added because it was missing: `InitLocalization::FixedPose` has always
@@ -119,11 +177,12 @@ Incoming LiDAR scans reach a single worker thread (`worker_lidar_`) via
 `onNewObservation` -> `sendLidarScanToProcessQueue`
 (`LidarOdometry_SensorCallbacks.cpp`). Two routes:
 
-- **LO (no IMU de-skew):** the scan is ready immediately and goes straight to
+- **No IMU received (yet):** the scan is ready immediately and goes straight to
   `submitReadyLidarScanToWorker()`.
-- **LIO (IMU de-skew):** the scan is parked on `worker_lidar_wait_for_imu_list_`
-  until IMU data covering its whole time span has arrived; `onIMUImpl` then
-  submits the now-ready scans via the same `submitReadyLidarScanToWorker()`.
+- **With IMU:** the scan is parked on `worker_lidar_wait_for_imu_list_` until IMU
+  data covering its whole time span has arrived; `onIMUImpl` then submits the
+  now-ready scans via the same `submitReadyLidarScanToWorker()`. See
+  "Timestamp-driven LiDAR/IMU synchronization" below.
 
 `submitReadyLidarScanToWorker()` implements a **"drop stale, keep freshest"**
 policy against a single pending slot (`worker_lidar_pending_fresh_scan_`): if the
@@ -167,18 +226,133 @@ instead of a brief quality dip that recovers to the true pose).
 
 ## Local-map locking: `state_mtx_` vs `local_map_content_mtx_`
 
-Rendering the local map (`updateVisualizationLocalMap()`) is O(map size) and
-must not run under `state_mtx_`, or it stalls the dataset reader, IMU worker
-and executor threads once the map is large. So it releases `state_mtx_` (via
-the caller's `std::unique_lock`, passed down through
-`updateVisualization*()`) and takes the finer-grained `local_map_content_mtx_`
-instead, which every mutation of `state_.local_map` contents (insert, `clear()`,
-`load_from_file()`) must also hold.
+Rendering the local map is O(map size) and must not run on the LiDAR worker
+thread, nor under `state_mtx_`: under `mola::IncrementalPointCloud` it measured
+~55 ms mean / ~120 ms max on a GrandTour mission, which turned roughly one
+`onLidar` in 18 into a >100 ms spike and backed the scan queue up to 18 entries.
+So `updateVisualizationLocalMap()` only makes the decimation decision and
+snapshots what the render needs (map `shared_ptr`, `render_params_t`, viz frame),
+then enqueues the render on `worker_viz_local_map_`. There it takes only the
+finer-grained `local_map_content_mtx_`, which every mutation of
+`state_.local_map` contents (insert, `clear()`, `load_from_file()`) must also
+hold. Effect on the same run: the inline cost drops to ~5 us and `onLidar`'s max
+from 155 ms to 66 ms, with the same number of renders.
 
-Lock order: take `state_mtx_` first, then `local_map_content_mtx_`; never hold
-the latter while acquiring the former. Note the renderer therefore *releases*
-`state_mtx_` before taking the contents mutex, and releases the contents mutex
-before re-acquiring `state_mtx_`.
+`worker_viz_local_map_` is deliberately a **separate** 1-thread
+`POLICY_DROP_OLD` pool from `worker_viz_`: with one thread that policy caps the
+queue at a single pending task, so sharing the pool would let the per-scan
+current-observation frames drop the much rarer local-map render before it ever
+ran. The "hide the local map" clear is routed through the same pool so it cannot
+be overtaken by a render already in flight.
+
+`visualization.map_update_decimation` (`MOLA_GUI_MAP_UPDATE_DECIMATION`,
+default 10 in most pipelines) bounds how often that render is even requested.
+The render itself no longer holds `local_map_content_mtx_` for its whole
+duration: `cheapLayerSnapshot()` deep-copies the layers under the mutex and the
+O(map size) recolorize/OpenGL build then runs on that private copy, unlocked.
+The copy is ~6x cheaper than the render it replaces in the critical section
+(27 ms vs 182 ms mean on Oxford Spires), which takes `onLidar`'s max from
+216 ms to 107 ms and makes `onLidar.4.update_local_map` equal to the insertion
+it wraps, i.e. zero lock wait.
+
+Point layers are copied into a plain `CGenericPointsMap` rather than cloned
+through their own type: `insertAnotherMap()` calls `registerPointFieldsFrom()`
+(so every per-point field survives) and skips non-finite points (so the slots
+`IncrementalPointCloud` blanks on eviction are dropped), while the target has no
+spatial index to build. Cloning an `IncrementalPointCloud` through its own copy
+constructor would instead `resetIndex()`, an O(N log N) k-d tree bulk build the
+renderer never queries. The copy does pick up the storage slots that are
+tombstoned but not reclaimed yet; that measured under 2% of storage
+(`MOLA_INCREMENTAL_MAP_DEBUG_STATS`: live/storage 0.999 mean, 0.982 worst), and
+it is the same trade-off `doPublishUpdatedLocalMap()` already makes.
+
+The render worker pays ~20 ms more per render for the extra copy step, which is
+fine: it is off the critical path by construction.
+
+## Timestamp-driven LiDAR/IMU synchronization
+
+IMU readings are **not** consumed when they arrive. `onIMUImpl()` only appends
+them to `pending_imu_` (`PendingImuBuffer`, `ImuScanSync.h`) and updates
+`latest_imu_time_`, inline on the sensor-input thread. A scan is held on
+`worker_lidar_wait_for_imu_list_` (`ScanImuWaitList`) until `latest_imu_time_`
+reaches the scan's own coverage end (its timestamp plus the estimated scan
+period, frozen when the scan is parked). `processLidarScan()` then calls
+`consumePendingImu()`, which feeds every buffered sample up to that same time,
+in timestamp order, into the de-skew velocity buffer, the pitch/roll
+calibrator and the gravity estimators.
+
+The IMU samples a scan sees are therefore a function of the timestamps alone,
+never of how the sensor callbacks interleaved, which is what makes two identical
+offline runs produce identical trajectories. `mola_state_estimation_simple`
+buffers IMU readings the same way for the same reason.
+
+Limits: the gate only engages after the first IMU reading, so scans preceding it
+are processed straight away. Reproducibility also assumes no scan is dropped for
+overload, which is the offline case.
+
+**The wait is bounded** (`params_.max_time_to_wait_for_imu`, default 0.5 s). An
+IMU that stops mid-run freezes `latest_imu_time_`, so without a bound every later
+scan waits for data that never comes and the odometry stalls permanently and
+silently (`max_lidar_queue_before_drop` then merely recycles the wait list).
+`imu_scan_release_time()` (`ImuScanSync.h`) therefore also releases scans whose
+coverage end is older than `latest_obs_time_ - max_time_to_wait_for_imu`: the
+odometry degrades to LiDAR-only and picks the IMU back up by itself when it
+returns. Set the parameter to 0 to wait indefinitely.
+
+The bound is in **sensor time** (`latest_obs_time_`, the newest timestamp on any
+input), never the wall clock. That is what keeps it reproducible: a wall-clock
+timeout would make the released set depend on machine load, reintroducing the
+nondeterminism this design exists to remove, and it would buy nothing, since a
+run whose inputs have all gone silent has nothing to process anyway.
+
+Releasing a scan without its IMU means the pipeline moves past instants whose
+readings may still arrive (also possible when an input interleaves the two
+streams out of order). `PendingImuBuffer` keeps a watermark of the newest
+consumed instant and rejects anything at or below it, so IMU data is never
+applied out of chronological order; `clear()` resets it, a reset being a new
+session.
+
+**End of input.** The last scans of a run are parked waiting for IMU that the
+dataset no longer contains, so they must be flushed explicitly or they are lost:
+`flushPendingLidarScans()` releases them regardless of coverage and blocks until
+the worker is idle. `shutdownCleanup()` calls it, which covers everything going
+through `onQuit()`; `mola-lidar-odometry-cli` calls it directly after the replay
+loop, because it reads `estimatedTrajectory()` before that point. Note that
+`isBusy()` deliberately does **not** count the wait list: callers poll it between
+observations, and a parked scan is only released by a later observation, so
+counting it there would deadlock.
+
+## `imu_state_mtx_`: the sensor input no longer waits on the LiDAR worker
+
+`processLidarScan()` holds `state_mtx_` for its whole body, so an `onIMU()` that
+also took `state_mtx_` blocked for the duration of every scan. At 200-400 Hz IMU
+vs 10 Hz LiDAR that meant the IMU worker's total time tracked `onLidar`'s almost
+exactly (33.1 s vs 32.7 s on Oxford Spires), and since
+`releaseReadyLidarScansToWorker()` is the last thing `onIMU()` does, the wait fed
+straight back into scan-submission latency.
+
+`imu_state_mtx_` (recursive) now guards exactly the state the two threads share:
+`pending_imu_`, `imu_initializer`, `gravity_estimator`, `map_gravity`,
+`recent_imu_stamps`, `parameter_source` (variable map, `realize()` flags, and the
+`localVelocityBuffer` that IMU samples write and the deskew stage reads), and
+any *invocation* of `obs_generators`. `onIMU()` takes only this mutex; the LiDAR
+thread takes it in short windows on top of `state_mtx_`. Result on the same
+sequence: `onIMU` mean 957 -> 349 us, max 138.6 -> 9.7 ms, total 33.1 -> 12.4 s,
+with `onLidar` unchanged.
+
+The residual 12.4 s is accounted for exactly by the two stages that genuinely
+share those objects, `onLidar.0.apply_generators` (3.0 ms/scan) and
+`onLidar.1.deskew_early` (3.8 ms/scan), plus the ~176 us of real per-sample work.
+Removing it means making `mola::imu::LocalVelocityBuffer` internally thread-safe
+(it has no mutex today) so `FilterDeskew`'s single
+`collect_samples_around_reference_time()` snapshot can run concurrently with IMU
+appends; that is a `mola_imu_preintegration` change, not one for this repo.
+
+Full lock order: `state_mtx_` -> `local_map_content_mtx_` -> `imu_state_mtx_`.
+Never the reverse. The sensor input takes only `imu_state_mtx_` and the local-map
+render worker only `local_map_content_mtx_`, so neither can invert it. Anything
+that replaces `state_` wholesale (`reset()`) or rebuilds the pipelines
+(`initialize()`) must hold `state_mtx_` **and** `imu_state_mtx_`.
 
 
 ## Keyframe-creation policy (shared by local map and simplemap)
@@ -408,7 +582,14 @@ We use colcon, the ROS2 build tool, and mola_common with utility cmake helpers.
 
 - **Framework**: CMake + GTest
 - Each package has `tests/` with its own `CMakeLists.txt`
-- CI/CD: `.github/workflows/` — builds on ROS 2 Humble, Jazzy, Kilted, Rolling
+- CI/CD: `.github/workflows/build-ros.yml` has two matrices. GitHub-hosted
+  (x86_64) runs Humble/Jazzy/Rolling/Lyrical stable plus Jazzy testing+coverage;
+  Humble and Rolling testing entries exist commented-out, Lyrical has none.
+  There, `setup ROS environment` only runs for testing entries, so stable ones
+  need a prebuilt `ros:<distro>` image (or the manual `ubuntu:resolute` setup
+  used for pre-buildfarm distros like Lyrical). Self-hosted (arm64) only covers
+  Humble/Jazzy, each stable + testing, and runs `setup ROS environment`
+  unconditionally for both.
 - Style: enforced with `.clang-format` and `.clang-tidy`
 
 ## Code style

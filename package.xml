@@ -5,7 +5,7 @@
 -->
 <package format="3">
   <name>mola_lidar_odometry</name>
-  <version>3.0.0</version>
+  <version>3.1.0</version>
   <description>LIDAR odometry system based on MOLA and MRPT components</description>
 
   <maintainer email="joseluisblancoc@gmail.com">Jose-Luis Blanco-Claraco</maintainer>
@@ -61,6 +61,7 @@
   <!-- Needed by the mola-lo-* scripts: -->
   <exec_depend>mola_launcher</exec_depend>
   <exec_depend>mola_viz</exec_depend>
+  <exec_depend>mola_bridge_ros2</exec_depend>
 
   <!-- Test datasets to run on them: -->
   <test_depend>mola_test_datasets</test_depend>
