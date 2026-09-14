@@ -603,6 +603,12 @@ def generate_launch_description():
         default_value='false',
         description='Use simulation (bag) clock if true')
 
+    mola_node_prefix = LaunchConfiguration('mola_node_prefix')
+    declare_mola_node_prefix_cmd = DeclareLaunchArgument(
+        'mola_node_prefix',
+        default_value='',
+        description='Command placed before mola-cli, e.g. "taskset -c 4-7" to pin it to cores')
+
     # Map fully qualified names to relative ones so the node's namespace can be prepended.
     # In case of the transforms (tf), currently, there doesn't seem to be a better alternative
     # https://github.com/ros/geometry2/issues/32
@@ -646,6 +652,7 @@ def generate_launch_description():
                 package='mola_launcher',
                 executable='mola-cli',
                 output='screen',
+                prefix=mola_node_prefix,
                 remappings=active_tf_remaps,
                 arguments=[mola_system_yaml_file],
                 parameters=[{'use_sim_time': use_sim_time}],
@@ -685,6 +692,7 @@ def generate_launch_description():
         declare_use_namespace_cmd,
         declare_use_namespaced_tf_cmd,
         declare_use_sim_time_cmd,
+        declare_mola_node_prefix_cmd,
         enforce_planar_motion_arg,
         enforce_planar_motion_env_var,
         forward_ros_tf_odom_to_mola_arg,
