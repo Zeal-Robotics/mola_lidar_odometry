@@ -27,7 +27,6 @@
 
   <!-- dataset input sources (all are actually optional) -->
   <depend>mola_input_rawlog</depend>
-  <depend>mola_input_rosbag1</depend>
   <depend>mola_input_rosbag2</depend>
 
   <!-- mola_input_rosbag1 is genuinely optional (unlike the ones above, not yet
@@ -70,7 +69,6 @@
   <exec_depend>mola_bridge_ros2</exec_depend>
 
   <!-- Test datasets to run on them: -->
-  <test_depend>mola_test_datasets</test_depend>
   <test_depend>mola_metric_maps</test_depend>
   <test_depend>rosbag2_storage_mcap</test_depend> <!-- Needed to be able to open mcap test files -->
 
