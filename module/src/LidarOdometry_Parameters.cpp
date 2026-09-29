@@ -169,9 +169,9 @@ void LidarOdometry::Parameters::Visualization::initializeModelPart(const Yaml & 
   const auto models = cfg["model"].asSequenceRange();
   for (const auto & e : models) {
     ASSERT_(e.isMap());
-    auto c = e.asMap();
+    const mrpt::containers::yaml c(e);
     auto & m = model.emplace_back();
-    ASSERT_(c.count("file") != 0);
+    ASSERT_(c.has("file"));
     m.file = c["file"].as<std::string>();
 
     if (m.file.empty()) {
@@ -179,25 +179,25 @@ void LidarOdometry::Parameters::Visualization::initializeModelPart(const Yaml & 
       continue;
     }
 
-    if (c.count("tf.x") != 0) {
+    if (c.has("tf.x")) {
       m.tf.x = c["tf.x"].as<float>();
     }
-    if (c.count("tf.y") != 0) {
+    if (c.has("tf.y")) {
       m.tf.y = c["tf.y"].as<float>();
     }
-    if (c.count("tf.z") != 0) {
+    if (c.has("tf.z")) {
       m.tf.z = c["tf.z"].as<float>();
     }
-    if (c.count("tf.yaw") != 0) {
+    if (c.has("tf.yaw")) {
       m.tf.yaw = mrpt::DEG2RAD(c["tf.yaw"].as<float>());
     }
-    if (c.count("tf.pitch") != 0) {
+    if (c.has("tf.pitch")) {
       m.tf.pitch = mrpt::DEG2RAD(c["tf.pitch"].as<float>());
     }
-    if (c.count("tf.roll") != 0) {
+    if (c.has("tf.roll")) {
       m.tf.roll = mrpt::DEG2RAD(c["tf.roll"].as<float>());
     }
-    if (c.count("scale") != 0) {
+    if (c.has("scale")) {
       m.scale = c["scale"].as<float>();
     }
   }
@@ -263,6 +263,7 @@ void LidarOdometry::Parameters::SimpleMapOptions::initialize(const Yaml & cfg, P
   YAML_LOAD_OPT(add_non_keyframes_too, bool);
   YAML_LOAD_OPT(generate_lazy_load_scan_files, bool);
   YAML_LOAD_OPT(save_gnss_max_age, double);
+  YAML_LOAD_OPT(save_imu_max_age, double);
   YAML_LOAD_OPT(save_deskewed_scans, bool);
 }
 
@@ -280,6 +281,7 @@ void LidarOdometry::Parameters::MapUpdateOptions::initialize(const Yaml & cfg, P
   DECLARE_PARAMETER_IN_OPT(cfg, max_distance_to_keep_keyframes, parent);
   DECLARE_PARAMETER_IN_OPT(cfg, check_for_removal_every_n, parent);
   DECLARE_PARAMETER_IN_OPT(cfg, publish_map_updates_every_n, parent);
+  YAML_LOAD_OPT(publish_local_map, bool);
   YAML_LOAD_OPT(load_existing_local_map, std::string);
   YAML_LOAD_OPT(save_final_local_map, std::string);
 
@@ -304,8 +306,21 @@ void LidarOdometry::Parameters::InitialLocalizationOptions::initialize(const Yam
 
   YAML_LOAD_OPT(additional_uncertainty_after_reloc_how_many_timesteps, uint32_t);
   YAML_LOAD_OPT(additional_map_freeze_after_reloc_how_many_timesteps, uint32_t);
+  YAML_LOAD_OPT(imu_initial_calibration_window_seconds, double);
+  YAML_LOAD_OPT(imu_initial_calibration_min_samples, uint32_t);
+  YAML_LOAD_OPT(imu_initial_calibration_max_dispersion_deg, double);
+  YAML_LOAD_OPT(imu_initial_calibration_dispersion_timeout, double);
   YAML_LOAD_OPT(imu_initial_calibration_sample_count, uint32_t);
   YAML_LOAD_OPT(imu_initial_calibration_max_age, double);
+
+  // Backwards compatibility: a configuration written for the sample-count knob alone keeps its
+  // exact former behavior, so upgrading does not silently change what it averages. As soon as
+  // the time window is named in the YAML, it is the one in charge and the sample count is
+  // ignored (a fixed sample count cannot be met inside a fixed window at an arbitrary rate).
+  imu_initial_calibration_legacy_mode = cfg.has("imu_initial_calibration_sample_count") &&
+                                        !cfg.has("imu_initial_calibration_window_seconds");
+
+  ASSERT_(imu_initial_calibration_window_seconds > 0 || imu_initial_calibration_legacy_mode);
   YAML_LOAD_OPT(use_imu_orientation, bool);
   YAML_LOAD_OPT(from_state_estimator_max_position_sigma, double);
   YAML_LOAD_OPT(from_state_estimator_max_orientation_sigma_deg, double);
@@ -340,6 +355,8 @@ void LidarOdometry::Parameters::IMUGravityCorrection::initialize(const Yaml & cf
   YAML_LOAD_OPT(sigma_deg, double);
   YAML_LOAD_OPT(averaging_samples, uint32_t);
   YAML_LOAD_OPT(max_age_seconds, double);
+  YAML_LOAD_OPT(map_origin_max_dispersion_deg, double);
+  YAML_LOAD_OPT(map_origin_capture_timeout, double);
 
   if (enabled) {
     ASSERTMSG_(
@@ -352,8 +369,35 @@ void LidarOdometry::Parameters::IMUGravityCorrection::initialize(const Yaml & cf
       sigma_deg > 0, mrpt::format("imu_gravity_correction.sigma_deg=%.4f must be > 0", sigma_deg));
   }
 
+  if (cfg.has("odometry_attitude")) {
+    odometry_attitude.initialize(cfg["odometry_attitude"]);
+  }
+
   if (cfg.has("map_gravity")) {
     map_gravity.initialize(cfg["map_gravity"]);
+  }
+}
+
+void LidarOdometry::Parameters::IMUGravityCorrection::OdometryAttitude::initialize(const Yaml & cfg)
+{
+  YAML_LOAD_OPT(enabled, bool);
+  YAML_LOAD_OPT(sensor_label, std::string);
+  YAML_LOAD_OPT(sigma_deg, double);
+  YAML_LOAD_OPT(max_age_seconds, double);
+
+  if (enabled) {
+    ASSERTMSG_(
+      !sensor_label.empty(),
+      "imu_gravity_correction.odometry_attitude.sensor_label cannot be empty when enabled");
+    ASSERTMSG_(
+      sigma_deg > 0,
+      mrpt::format(
+        "imu_gravity_correction.odometry_attitude.sigma_deg=%.4f must be > 0", sigma_deg));
+    ASSERTMSG_(
+      max_age_seconds >= 0,
+      mrpt::format(
+        "imu_gravity_correction.odometry_attitude.max_age_seconds=%.4f must be >= 0",
+        max_age_seconds));
   }
 }
 
@@ -363,6 +407,15 @@ void LidarOdometry::Parameters::IMUGravityCorrection::MapGravity::initialize(con
   YAML_LOAD_OPT(solve_every_n, uint32_t);
   ASSERT_(solve_every_n >= 1);
   YAML_LOAD_OPT(log_only, bool);
+  YAML_LOAD_OPT(relevel_map_frame, bool);
+  YAML_LOAD_OPT(relevel_min_intervals, uint32_t);
+  ASSERT_(relevel_min_intervals >= 1);
+  YAML_LOAD_OPT(relevel_min_tilt_deg, double);
+  ASSERTMSG_(
+    relevel_min_tilt_deg > 0,
+    mrpt::format(
+      "imu_gravity_correction.map_gravity.relevel_min_tilt_deg=%.4f must be > 0",
+      relevel_min_tilt_deg));
   YAML_LOAD_OPT(min_interval_seconds, double);
   ASSERTMSG_(
     min_interval_seconds > 0,
@@ -377,7 +430,8 @@ void LidarOdometry::Parameters::IMUGravityCorrection::MapGravity::initialize(con
     const auto key = k.as<std::string>();
     if (
       key == "enabled" || key == "solve_every_n" || key == "min_interval_seconds" ||
-      key == "log_only") {
+      key == "log_only" || key == "relevel_map_frame" || key == "relevel_min_intervals" ||
+      key == "relevel_min_tilt_deg") {
       continue;
     }
     estimator_params[key] = v;

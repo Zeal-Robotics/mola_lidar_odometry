@@ -1,0 +1,206 @@
+# =====================================================================================
+# Pipeline: GICP over a point map AND a TSDF, matched jointly
+#
+# The local map holds two representations of the same surroundings at once:
+#
+#   * `localmap`: the shipped point map, matched cov-to-cov (as lidar3d-gicp.yaml)
+#   * `tsdf`:     a truncated signed distance field, matched point-to-plane
+#
+# Both matchers write into the same pairing set, and Solver_GaussNewton sums
+# both residual blocks into one normal equation, so this is a single joint
+# registration and not two sequential ones.
+#
+# Why carry both. A point map's surface is wherever the measurements landed, so
+# it inherits their noise and any systematic range error; a fused field averages
+# every measurement of a surface, which removes that bias but answers only
+# within its truncation band and is coarser than a k-d tree at close range.
+# Measured on the 13 Oxford Spires sequences against lidar3d-gicp.yaml with the
+# same dataset profile: pooled vertical drift +1.415 -> +0.166 mm/m, better on
+# 13 of 13 sequences, per-segment tilt drift better on 11 of 13, and median APE
+# 0.142 -> 0.117 m, for about +21% per scan. The field alone reaches the same
+# vertical figure but loses tilt on 6 of those sequences and costs APE, because
+# nothing answers where the field cannot.
+#
+# The knob that matters is MOLA_PAIRW_PT2PL, the relative scale of the two
+# blocks; see the comment on `pair_weights` below before changing it.
+# =====================================================================================
+
+$import: lidar3d-gicp.yaml
+
+params:
+  pipeline_name: "GICP over a point map AND a TSDF, matched jointly" # For display/debug only
+
+icp_settings_with_vel:
+  solvers:
+    - class: mp2p_icp::Solver_GaussNewton
+      params:
+        maxIterations: ${MOLA_LO_SOLVER_MAX_ITERS|1}
+        robustKernel: "${MOLA_LO_ROBUST_KERNEL|RobustKernel::GemanMcClure}"
+        robustKernelScale: "${MOLA_LO_ROBUST_KERNEL_SCALE|2.449489742783178}" # [sigmas]
+        robustKernelPriorRefBlend: "${MOLA_LO_ROBUST_KERNEL_PRIOR_REF_BLEND|0.0}"
+        # Relative scale of the two residual blocks below, and the one knob
+        # this pipeline really has. It is an inverse variance: pt2pl = 1000
+        # asserts a ~3 cm sigma on the field's point-to-plane residual, which
+        # is what puts it on a par with the cov-to-cov block, whose surface
+        # covariance is regularized to (1, 1, 1e-3) and so already carries
+        # about 500 per pairing.
+        #
+        # Leaving it at 1.0 does NOT give "equal weight": it makes the field
+        # block a few tenths of a percent of the information, and the arm then
+        # reproduces plain lidar3d-gicp.yaml. Values from 400 to 1000 were
+        # measured on Oxford Spires; 400 favors tilt slightly, 1000 favors
+        # vertical drift and APE.
+        #
+        # NOTE: the per-layer `weight` key inside a matcher's layer list is a
+        # legacy no-op in mp2p_icp. This is the live control.
+        pair_weights:
+          pt2pt: 1.0
+          pt2pl: ${MOLA_PAIRW_PT2PL|1000.0}
+          pt2ln: 1.0
+          ln2ln: 1.0
+          pl2pl: 1.0
+
+        geometry_class_weights:
+          enabled: ${MOLA_GCW_ENABLED|false}
+          variable: "${MOLA_GCW_VARIABLE|incidence}"
+          gravity_source: "${MOLA_GCW_GRAVITY_SOURCE|map_frame}"
+          softness: ${MOLA_GCW_SOFTNESS|10.0}
+          breakpoints:
+            - ${MOLA_GCW_BREAKPOINT|60.0}
+          weights:
+            - ${MOLA_GCW_W_LOW|1.0}
+            - ${MOLA_GCW_W_HIGH|1.0}
+
+  matchers:
+    # Block 1: the shipped cov-to-cov residual over the point map. Unchanged
+    # from the baseline pipeline.
+    - class: mp2p_icp::Matcher_Cov2Cov
+      params:
+        threshold: "2.0*ADAPTIVE_THRESHOLD_SIGMA"
+        thresholdFar: "${MOLA_MATCH_THRESHOLD_FAR|0}"
+        thresholdKneeRange: "${MOLA_MATCH_THRESHOLD_KNEE|15.0}"
+        thresholdTransitionWidth: "${MOLA_MATCH_THRESHOLD_WIDTH|5.0}"
+        pointWeightAlpha: "${MOLA_POINT_WEIGHT_ALPHA|0}"
+        pointWeightRefRange: "${MOLA_POINT_WEIGHT_REF_RANGE|20.0}"
+        pointWeightMin: "${MOLA_POINT_WEIGHT_MIN|0.01}"
+        pointWeightMax: "${MOLA_POINT_WEIGHT_MAX|1.0}"
+        pairingsPerPoint: 1
+        allowMatchAlreadyMatchedGlobalPoints: true
+        layerMatches:
+          - { global: "${MOLA_LOCALMAP_LAYER_NAME|localmap}", local: "observation" }
+
+    # Block 2: point-to-plane against the distance field. Both blocks land in
+    # the same H and g (see mp2p_icp::optimal_tf_gauss_newton), so this is one
+    # joint optimization and not two sequential registrations.
+    - class: mp2p_icp::Matcher_Point2Plane
+      params:
+        distanceThreshold: "${ICPB_PT2PL_THRESHOLD|2.0*ADAPTIVE_THRESHOLD_SIGMA}"
+        allowMatchAlreadyMatchedGlobalPoints: true
+        pointLayerMatches:
+          - { global: "${MOLA_TSDF_LAYER_NAME|tsdf}", local: "decimated_for_icp" }
+
+localmap_generator:
+  - class_name: mp2p_icp_filters::Generator
+    params:
+      target_layer: "${MOLA_LOCALMAP_LAYER_NAME|localmap}"
+      throw_on_unhandled_observation_class: true
+      process_class_names_regex: "" # NONE: don't process observations in the generator.
+
+      metric_map_definition:
+        class: ${MOLA_LOCALMAP_CLASS|mola::KeyframePointCloudMap}
+        plugin: "libmola_metric_maps.so"
+        creationOpts:
+          k_correspondences_for_cov: ${MOLA_LOCALMAP_K_CORRESPONDENCES_FOR_COV|20}
+          min_correspondences_for_cov: ${MOLA_LOCALMAP_MIN_CORRESPONDENCES_FOR_COV|5}
+          max_distance_for_cov: ${MOLA_LOCALMAP_MAX_DISTANCE_FOR_COV|2.0}
+          max_plane_deviation_for_cov: ${MOLA_LOCALMAP_MAX_PLANE_DEV_FOR_COV|0}
+          plane_regularization_lambda: ${MOLA_LOCALMAP_PLANE_REG_LAMBDA|0.001}
+          min_neighbors_to_cache_cov: ${MOLA_LOCALMAP_MIN_NEIGHBORS_TO_CACHE_COV|0}
+          remove_points_farther_than: "${MOLA_INCREMENTAL_MAP_MAX_SIZE|$f{max(100.0, 1.0*ESTIMATED_OBSERVATION_RADIUS)}}" # [m]
+          async_rebuild: ${MOLA_INCREMENTAL_MAP_ASYNC_REBUILD|true}
+          alpha_balance: ${MOLA_INCREMENTAL_MAP_ALPHA_BALANCE|0.75}
+          alpha_deleted: ${MOLA_INCREMENTAL_MAP_ALPHA_DELETED|0.5}
+          reserve_points: ${MOLA_INCREMENTAL_MAP_RESERVE_POINTS|2000000}
+          max_search_keyframes: ${MOLA_LOCALMAP_MAX_SEARCH_KEYFRAMES|3}
+          use_view_direction_filter: ${MOLA_LOCALMAP_USE_VIEW_DIRECTION_FILTER|true}
+          max_view_angle_deg: ${MOLA_LOCALMAP_VIEW_DIRECTION_FILTER_ANGLE_DEG|120}
+          rotation_distance_weight: 2.0
+          num_diverse_keyframes: ${MOLA_LOCALMAP_DIVERSE_KEYFRAMES|1}
+          approximate_cov: ${MOLA_LOCALMAP_APPROXIMATE_COV|false}
+        insertOpts:
+          remove_frames_farther_than: "${MOLA_LOCAL_MAP_MAX_SIZE|$f{max(100.0, 1.50*ESTIMATED_OBSERVATION_RADIUS)}}" # [m]
+        likelihoodOpts: ~
+        renderOpts:
+          color.A: 0.25
+          colormap: "cmHOT"
+          recolorByPointField: ${MOLA_GUI_LOCAL_MAP_COLOR_BY_COORDINATE|intensity}
+          max_points_per_kf: ${MOLA_LOCALMAP_VIZ_MAX_POINTS_PER_KF|10000}
+          max_overall_points: ${MOLA_LOCALMAP_VIZ_MAX_POINTS_OVERALL|500000}
+
+  # Second local-map layer: the same truncated signed distance field described
+  # above, kept ALONGSIDE the shipped point map rather than in place of it.
+  # Both are updated from every keyframe and both are matched against the
+  # scan, so the Gauss-Newton solver sums a cov-to-cov block over the point
+  # map and a point-to-plane block over the field in one normal equation. The
+  # relative weight of the two blocks is `pair_weights.pt2pl` in the solver,
+  # NOT the per-layer `weight` key, which is a legacy no-op.
+  - class_name: mp2p_icp_filters::Generator
+    params:
+      target_layer: "${MOLA_TSDF_LAYER_NAME|tsdf}"
+      throw_on_unhandled_observation_class: true
+      process_class_names_regex: "" # NONE: don't process observations in the generator.
+
+      metric_map_definition:
+        class: mola::TSDF
+        plugin: "libmola_metric_maps.so"
+        creationOpts:
+          voxel_size: "${MOLA_TSDF_VOXEL_SIZE|0.30}" # [m]
+        insertOpts:
+          truncation_voxels: ${MOLA_TSDF_TRUNCATION_VOXELS|4.0}
+          ray_tube_voxels: ${MOLA_TSDF_RAY_TUBE_VOXELS|1.5}
+          tube_sigma_voxels: ${MOLA_TSDF_TUBE_SIGMA_VOXELS|0.25}
+          max_weight: ${MOLA_TSDF_MAX_WEIGHT|64.0}
+          min_weight_for_query: ${MOLA_TSDF_MIN_WEIGHT|0.05}
+          weight_by_range: ${MOLA_TSDF_WEIGHT_BY_RANGE|false}
+          weight_range_ref: ${MOLA_TSDF_WEIGHT_RANGE_REF|10.0}
+          weight_by_incidence: ${MOLA_TSDF_WEIGHT_BY_INCIDENCE|false}
+          remove_voxels_farther_than: ${MOLA_TSDF_MAP_EXTENT|60.0} # [m]
+          max_voxels: ${MOLA_TSDF_MAX_VOXELS|12000000}
+          # The point map above already answers from scan one, so the field
+          # could in principle start cold here. It is left on so this arm
+          # differs from a single-TSDF pipeline in the extra layer alone.
+          bootstrap_with_points: ${MOLA_TSDF_BOOTSTRAP|true}
+          bootstrap_min_scans: ${MOLA_TSDF_BOOTSTRAP_MIN_SCANS|10}
+          bootstrap_max_scans: ${MOLA_TSDF_BOOTSTRAP_MAX_SCANS|200}
+          bootstrap_field_ready_fraction: ${MOLA_TSDF_BOOTSTRAP_READY|0.9}
+          bootstrap_knn: ${MOLA_TSDF_BOOTSTRAP_KNN|10}
+          bootstrap_max_plane_deviation: ${MOLA_TSDF_BOOTSTRAP_MAX_DEV|0.5}
+        likelihoodOpts: ~
+        renderOpts:
+          point_size: ${MOLA_TSDF_POINT_SIZE|2.0}
+          # The surface is drawn where the field changes sign, interpolated
+          # between the two voxels, so it is not quantized to the grid.
+          # Colored by "z" or by "weight" (how much evidence backs it);
+          # cmNONE falls back to the uniform points_color.
+          colormap: ${MOLA_TSDF_COLORMAP|cmHOT}
+          recolorize_by: "${MOLA_TSDF_COLOR_BY|z}"
+          # Draws a shaded surface instead of points: much prettier, much
+          # slower. For figures and for a close look, not for a live run.
+          render_as_mesh: ${MOLA_TSDF_RENDER_AS_MESH|false}
+
+insert_observation_into_local_map:
+  - class_name: mp2p_icp_filters::FilterMerge
+    params:
+      name: "FilterMerge (map into localmap)"
+      input_pointcloud_layer: "decimated_for_map"
+      target_layer: "${MOLA_LOCALMAP_LAYER_NAME|localmap}"
+      input_layer_in_local_coordinates: true
+      robot_pose: [robot_x, robot_y, robot_z, robot_yaw, robot_pitch, robot_roll]
+
+  - class_name: mp2p_icp_filters::FilterMerge
+    params:
+      name: "FilterMerge (map into tsdf)"
+      input_pointcloud_layer: "decimated_for_map"
+      target_layer: "${MOLA_TSDF_LAYER_NAME|tsdf}"
+      input_layer_in_local_coordinates: true
+      robot_pose: [robot_x, robot_y, robot_z, robot_yaw, robot_pitch, robot_roll]

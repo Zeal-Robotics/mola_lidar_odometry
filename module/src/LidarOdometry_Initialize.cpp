@@ -159,6 +159,13 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
       params_.gnss_sensor_label = cfg["gnss_sensor_label"].as<std::string>();
     }
 
+    if (cfg.has("deskew_odometry_sensor_label")) {
+      const auto label = cfg["deskew_odometry_sensor_label"].as<std::string>();
+      if (!label.empty()) {
+        params_.deskew_odometry_sensor_label = label;
+      }
+    }
+
     ASSERT_(cfg.has("local_map_updates"));
     params_.local_map_updates.initialize(cfg["local_map_updates"], params_);
 
@@ -176,6 +183,8 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
 
     YAML_LOAD_OPT(params_, min_time_between_scans, double);
     YAML_LOAD_REQ(params_, min_icp_goodness, double);
+    YAML_LOAD_OPT(params_, icp_prior_weight, double);
+    YAML_LOAD_OPT(params_, max_registration_mahalanobis, double);
     // Accept the deprecated *_sensor_* keys as fallbacks before reading the new
     // canonical names, so a YAML that only sets the old key keeps working and a
     // YAML that sets both lets the new key win.
@@ -185,11 +194,16 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
       "absolute_minimum_sensor_range", params_.absolute_minimum_observation_radius);
     YAML_LOAD_OPT(params_, observation_radius_filter_coefficient, double);
     YAML_LOAD_OPT(params_, absolute_minimum_observation_radius, double);
+    YAML_LOAD_OPT(params_, observation_radius_quantile, double);
+    YAML_LOAD_OPT(params_, observation_radius_quantile_max_samples, uint32_t);
+    ASSERT_GT_(params_.observation_radius_quantile, 0.0);
+    ASSERT_LE_(params_.observation_radius_quantile, 1.0);
     YAML_LOAD_OPT(params_, start_active, bool);
 
     YAML_LOAD_OPT(params_, max_lidar_queue_before_drop, uint32_t);
     YAML_LOAD_OPT(params_, max_time_to_wait_for_imu, double);
     YAML_LOAD_OPT(params_, gnss_queue_max_size, uint32_t);
+    YAML_LOAD_OPT(params_, imu_queue_max_size, uint32_t);
     YAML_LOAD_OPT(params_, min_motion_model_xyz_cov_inv, double);
 
     YAML_LOAD_OPT(params_, optimize_twist, bool);
@@ -216,6 +230,14 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
     YAML_LOAD_OPT(params_, pipeline_profiler_enabled, bool);
     YAML_LOAD_OPT(params_, icp_profiler_enabled, bool);
     YAML_LOAD_OPT(params_, icp_profiler_full_history, bool);
+    YAML_LOAD_OPT(params_, drop_stale_scans, bool);
+
+    if (!params_.drop_stale_scans) {
+      MRPT_LOG_INFO(
+        "drop_stale_scans=false: the input queue will BLOCK instead of keeping only the "
+        "freshest scan. Intended for offline batch runs, where a lossless, reproducible "
+        "replay matters more than keeping up with the clock.");
+    }
 
     if (cfg.has("simplemap")) {
       params_.simplemap.initialize(cfg["simplemap"], params_);
@@ -273,6 +295,19 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
       params_.imu_gravity_correction.use_rank2_prior = false;
     }
 #endif
+
+    // The odometry attitude source feeds the rank-2 prior's reading only. The
+    // legacy pose-prior path derives its tilt straight from the accelerometer,
+    // so leaving this silently ignored there would look like the setting had
+    // no effect.
+    if (
+      params_.imu_gravity_correction.odometry_attitude.enabled &&
+      !params_.imu_gravity_correction.use_rank2_prior) {
+      MRPT_LOG_WARN(
+        "imu_gravity_correction.odometry_attitude is enabled but "
+        "use_rank2_prior is false: the legacy pose-prior path reads the "
+        "accelerometer directly, so the odometry attitude will be ignored.");
+    }
 
     if (c.has("initial_localization")) {
       params_.initial_localization.initialize(c["initial_localization"]);

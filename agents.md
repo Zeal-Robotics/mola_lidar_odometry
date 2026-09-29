@@ -8,42 +8,169 @@ This repository provides a LiDAR-Inertial Odometry (LIO) frontend for the MOLA f
 
 Official Docs: https://docs.mola-slam.org/latest/
 
-## `scripts/mola-lo-gui-conslam`: ROS 1 / ROS 2 bag autodetection
+## Dataset wrappers: `scripts/mola-lo-{gui,cli}-*` + `scripts/lib/`
 
-Accepts either a ROS 1 bag (`.bag`) or a ROS 2 bag (`.mcap`) as the first
-argument, autodetected from the file extension. `.mcap` selects
-`lidar_odometry_from_rosbag2.yaml` (`MOLA_INPUT_ROSBAG2`); anything else is
-assumed to be a ROS 1 bag and uses `lidar_odometry_from_rosbag1.yaml`
-(`MOLA_INPUT_ROSBAG1`), matching how `mola-lo-gui-rosbag1`/`mola-lo-gui-rosbag2`
-pick their launch file.
+Each supported dataset has exactly one description of itself, in
+`scripts/lib/profiles/<name>.sh`: its on-disk layout, topic names, frames,
+extrinsics and pipeline tweaks, exported as `MOLA_*` environment variables.
+A profile invokes nothing.
 
-## `lidar_odometry_from_rosbag1.yaml`: up to 3 bags replayed jointly
+Three kinds of consumer share it, so none of them restates a dataset:
 
-`rosbag_filename` is a sequence fed from `MOLA_INPUT_ROSBAG1` plus two
-optional slots, `MOLA_INPUT_ROSBAG1_2` / `_3` (empty entries are dropped by
-`Rosbag1Dataset`). Per-topic datasets that ship `/tf`, the IMU or the odometry
-in separate bag files therefore need no launch file of their own.
+- `mola-lo-gui-<name>` — online replay via `mola-cli` + a launch YAML.
+- `mola-lo-cli-<name>` — offline batch via `mola-lidar-odometry-cli`.
+- Out-of-tree harnesses (`eval/cli_*.sh`, the CI regression job) source
+  `lib/dataset-profile.sh` and call `mola_lo_load_profile` directly.
 
-## `scripts/mola-lo-gui-grandtour`
+Both binaries read the same variables: the launch YAMLs always did, and the
+offline CLI's `--lidar-sensor-label` / `--imu-sensor-label` /
+`--base-link-frame-id` / `--tf-topic` / `--tf-static-topic` carry matching
+`envname()` fallbacks (`MOLA_LIDAR_TOPIC`, `MOLA_IMU_TOPIC`,
+`MOLA_TF_BASE_LINK`, ...). An explicit flag still wins; an option that took
+its value from the environment is reported at startup, since it changes the
+run without appearing in the command line.
 
-GrandTour (ANYmal-D + "Boxi" payload) publishes one bag per topic, so the
-wrapper takes a *mission directory* (or its `*_hesai_undist.bag`) and resolves
-its siblings by the `<mission>_<topic>.bag` naming: LiDAR (required), the
-`tf_minimal` and `adis` bags (optional). Notes specific to this dataset:
+Every value a profile sets uses `: "${VAR:=default}"`, so **anything the
+caller exports first wins**. That is how a harness overrides one field
+without forking the profile. Two variables the caller sets:
 
-- The robot body frame is `base`, not `base_link` (`MOLA_TF_BASE_LINK`).
-- Extrinsics come from the dataset's own `/tf_static`
-  (`base -> box_base -> hesai_lidar` / `adis16475_imu`), so no fixed sensor
-  poses are needed when the tf bag is present; without it the LiDAR falls
-  back to a fixed pose at the origin.
-- The LiDAR topic used is the already-undistorted one, so deskewing defaults
-  to `MotionCompensationMethod::None` to avoid over-compensating motion.
-- The /tf tree view is ON by default here (this is a legged robot with a full
-  joint tree, which is the point), skipping the four frames that are not
-  physically on the body: `odom` (world-fixed, published inverted as a child
-  of `base`), `enu_origin` (geodetic, under `cpt7_imu`) and `dlio_odom` /
-  `dlio_map` (the onboard SLAM's frames, under `hesai_lidar`). Everything
-  else in the tree is real hardware, including the total-station `prism`.
+- `MOLA_LO_MODE` = `gui` | `cli`. Profiles branch on it where a dataset
+  genuinely differs — a camera bag is worth replaying for a preview and is
+  pure decode cost in a batch run.
+- `MOLA_LO_SKIP_STATE_ESTIMATOR=1` — for callers running a method with its
+  own internal estimator (the DLIO / Fast-LIO2 wrappers).
+
+A profile may also pick the pipeline, by publishing
+`MOLA_ODOMETRY_PIPELINE_YAML` the same way. Only where a dataset has a measured
+reason to differ, and the evidence goes in the profile.
+
+Adding a dataset means adding one profile plus two one-line wrappers, and
+listing it in `MOLA_LO_DATASET_WRAPPERS` in `CMakeLists.txt`.
+
+### Per-dataset notes
+
+- **kitti** selects `pipelines/lidar3d-icp.yaml` over the cov-to-cov default:
+  measured over 00-10 it wins 8/11 on translation and 7/11 on rotation at about
+  half the cost per scan. A forward ablation between the two pipelines found
+  the difference is not attributable to any one stage — intermediate
+  configurations are several times worse than either — so this is a per-dataset
+  choice, not a ranking of the pipelines.
+
+- **conslam** autodetects ROS 1 (`.bag`) vs ROS 2 (`.mcap`) from the
+  extension. `CONSLAM_BASE_FRAME` picks which frame the trajectory is
+  reported in: `imu` (default, the dataset's own reference frame) or
+  `lidar`, needed when scoring against a ground truth sampled in the LiDAR
+  frame. The two differ by a pure 180 deg yaw.
+- **hilti2022** (Hilti SLAM Challenge 2022 / Hilti-Oxford) ships one monolithic
+  bag per sequence: a Hesai PandarXT-32, an Alphasense IMU and five cameras,
+  with no `/tf` at all, so every sensor pose is fixed from the dataset's own
+  `lidar_calibration.yaml`. `HILTI2022_BASE_FRAME` picks the reported frame:
+  `imu` (default) or `lidar`. The default is the one that matters -- that
+  file declares the IMU as `base_link` at identity and the ground truth is
+  published in the IMU frame, so the estimate lands in the reference's own
+  frame with nothing to compose afterwards. Hand-held, so IMU deskewing and
+  IMU-derived initial pitch/roll, as in conslam; the clouds carry real
+  per-point timestamps. Only three of the sixteen sequences (`exp14`,
+  `exp16`, `exp18`) have a dense 6-DoF reference -- the rest ship surveyed
+  control points, which are positions, not poses. The name carries the
+  year because the Hilti challenges do not share a sensor suite: 2021 is an
+  Ouster/Livox rig, 2023's robot platform is RoboSense/Xsens, and 2026 has
+  no LiDAR in its bags. Note the IMU here reads gravity along -Z, i.e. it is
+  mounted upside down; that is the rig, confirmed against both the dataset's
+  own extrinsics and its ground-truth attitude, not a frame error.
+- **grandtour** publishes one bag per topic, so the profile takes a *mission
+  directory* (or one of its `*_<lidar>_undist.bag` files) and resolves the
+  siblings by the `<mission>_<topic>.bag` naming. The robot carries three
+  LiDARs -- Hesai and Livox on the Boxi payload, Velodyne on the ANYmal body
+  itself -- selected with `MOLA_GRANDTOUR_LIDAR=hesai|livox|velodyne` (default
+  `hesai`), or `hesai_raw` for the uncompensated Hesai cloud, which this
+  profile de-skews with the IMU plus the leg odometry's velocity (see "Wheel
+  odometry" below); all three "_undist" streams are plain `sensor_msgs/PointCloud2`,
+  so no per-sensor message handling was needed. Body frame is `base`, not
+  `base_link`. Extrinsics come from the mission's own `/tf_static`, so no
+  fixed poses are set. The LiDAR stream is already undistorted, so deskewing
+  defaults to `None`. The /tf tree view is on by default (this is a legged
+  robot with a full joint tree, which is the point), skipping the four frames not
+  physically on the body: `odom`, `enu_origin`, `dlio_odom`, `dlio_map`.
+  The local map defaults to `mola::IncrementalPointCloud` here: measured lower
+  ATE on every mission of this dataset carrying a reference trajectory (~46% on
+  average). That makes the profile **odometry only** by default -- set
+  `MOLA_LOCALMAP_CLASS=mola::KeyframePointCloudMap` for loop-closure SLAM.
+  `MOLA_MINIMUM_RANGE_FILTER` is 1.5 m and sits next to a cliff: 2.0 m is worse
+  by an order of magnitude, so measure before re-tuning it.
+  `MOLA_GRANDTOUR_CAMERA` picks the GUI preview camera: `hdr_front` (default),
+  `hdr_left`, `hdr_right`, or `alphasense_{front_center,front_left,front_right,
+  left,right}`. The three HDR cameras each have their own bag; the five
+  Alphasense ones share `<mission>_alphasense.bag`, so bag and topic are
+  resolved together. Preview only, in GUI mode: no odometry consumes it.
+- **tiers** records FIVE lidars at once — that is what the dataset is for —
+  so it gets one wrapper per sensor (`-ouster-os0`, `-ouster-os1`,
+  `-velodyne`, `-livox-horizon`, `-livox-avia`) rather than one that silently
+  picks a winner. Extrinsics are a co-located placeholder: these bags carry
+  no `/tf` and the dataset publishes no calibration.
+- **oxford-spires** stitches multipart sequences, ordering the `raw/ros2bag/`
+  parts by their trailing `_<n>` numerically.
+- **ouster** is gui-only: a live source, which the offline CLI cannot read.
+  An `.osf` may be given as the first argument. `mola-lo-gui-ouster-rev8`
+  (`OUSTER_VARIANT=rev8`) adds measured real-time LIO defaults for Rev8
+  4096-column sensors, chiefly `OUSTER_DECIMATE_COLUMNS=4` (decimation at the
+  source, before the per-point conversion), the `mola::IncrementalPointCloud`
+  local map, `MOLA_MINIMUM_ICP_QUALITY=0.3` (ICP quality is scan-to-map
+  overlap, not correctness; narrow FOV), inertial motion prediction
+  (`MOLA_NAVSTATE_IMU_PROPAGATION=true`, simple estimator) with
+  `MOLA_ICP_PRIOR_WEIGHT=30` (only sensible with that prediction), and GUI coloring by
+  the per-point RGB (`rgb` color field, gated by
+  `OUSTER_GUI_COLOR_BY_RGB`); the numbers are in the profile.
+
+## `lidar_odometry_from_rosbag1.yaml`: up to 5 bags replayed jointly
+
+`rosbag_filename` is a sequence fed from `MOLA_INPUT_ROSBAG1` plus four
+optional slots, `MOLA_INPUT_ROSBAG1_2` / `_3` / `_4` / `_5` (empty entries are
+dropped by `Rosbag1Dataset`). Per-topic datasets that ship `/tf`, the IMU, a
+camera or the odometry in separate bag files therefore need no launch file of
+their own. `mola_lo_bag_slots` in `lib/dataset-profile.sh` fills these and the
+comma-joined spelling the offline CLI takes, from one list. The cap was raised
+from 4 to 5 for GrandTour: lidar + tf + imu + odometry + camera is 5 bags in
+GUI mode once a caller opts into odometry fusion.
+
+## Wheel odometry, GUI and offline CLI alike
+
+Both `dataset_from_rosbag2()` / `dataset_from_rosbag1()` in
+`apps/mola-lidar-odometry-cli.cpp`, and the wheel-odometry entry in
+`mola-cli-launchs/lidar_odometry_from_rosbag1.yaml` / `rosbag2.yaml`, expose a
+`CObservationOdometry`-by-default entry gated on `${MOLA_ODOMETRY_TOPIC|''}`
+with `${MOLA_ODOM_SENSOR_LABEL|odom_wheels}`. Empty by default on purpose:
+`/odom` is a very common topic name across unrelated robots, so
+auto-detecting it would silently opt every bag that has one into wheel-odom
+fusion.
+
+`MOLA_ODOMETRY_OBS_CLASS` picks how the topic is read: the planar
+`CObservationOdometry` (default) or `CObservationRobotPose`, which keeps the
+full SE(3) pose and its 6x6 covariance. Use the latter for any 3D source
+(legged, VIO, aerial); the planar type drops z, roll and pitch. It needs a
+`mola_input_rosbag1`/`rosbag2` new enough to build it from a `nav_msgs/Odometry`.
+Honored identically by the offline CLI and both GUI launch YAMLs, so a
+profile that sets it (e.g. grandtour.sh) gets the same observation type in
+either mode.
+
+No `fixed_sensor_pose` on the planar entry: `mrpt::obs::CObservationOdometry`
+cannot carry one, so the twist must already be expressed in `base_link`
+(`nav_msgs/Odometry`'s `child_frame_id`). `CObservationRobotPose` does carry a
+sensor pose, so that restriction does not apply to it.
+
+`deskew_odometry_sensor_label` (`MOLA_DESKEW_ODOMETRY_NAME`, empty by default)
+names an odometry source whose velocity over each sweep replaces the state
+estimator's linear velocity in the de-skew twist variables (`vx,vy,vz`). The
+estimator's velocity comes from this module's own registrations, so de-skewing
+with it is a feedback loop that needs heavy filtering to stay stable, and then
+lags. Linear part only: replacing the angular part with an odometry's gait-rate
+angular velocity destabilized a GrandTour mission.
+
+GrandTour reads this source as `CObservationRobotPose`, but leaves fusion
+opt-in like every other profile; see `scripts/lib/profiles/grandtour.sh` for
+the measurements behind that and behind its loose velocity sigmas. The one
+exception is `MOLA_GRANDTOUR_LIDAR=hesai_raw`, which turns it on and uses it
+for de-skewing.
 
 ## Robot /tf tree visualization (opt-in)
 
@@ -85,6 +212,21 @@ footprint-to-base_link offset, not the localization starting pose). Use
 `initial_pose:="[x, y, z, yaw_deg, pitch_deg, roll_deg]"` (same format as
 `mola_footprint_to_base_link_tf`); empty (default) leaves the pipeline
 YAML's own fallback (origin) in place.
+
+## A manual relocalization request overrides `initial_localization.method`
+
+`relocalize_near_pose_pdf()` sets `method = InitLocalization::FixedPose` along
+with the requested pose. Without that, a system configured with
+`FromStateEstimator` (what `gnss_mode:=relocalize` selects in the ROS 2 launch)
+or `PitchAndRollFromIMU` would store the pose and never read it, while the
+`initial_localization_done = false` set by the same call already stopped scans
+from being processed in `onLidar()`: the request would stall the front end
+instead of relocalizing it. This is the case that matters most, since a manual
+request is typically what is used when the automatic source cannot converge
+(e.g. poor GNSS coverage).
+
+`relocalize_from_gnss()` moves the method back to `FromStateEstimator`, so the
+two entry points can be alternated at runtime.
 
 ## State estimator integration
 
@@ -194,6 +336,41 @@ keeps end-to-end latency near a single processing period (so the state-estimator
 prediction is queried only a little into the future) for both LO and LIO.
 `params_.max_lidar_queue_before_drop` now only bounds the IMU wait list.
 
+### Lossless mode: `drop_stale_scans: false` (`MOLA_DROP_STALE_SCANS`)
+
+That trade (data for latency) is the wrong one offline, where every scan must be
+processed and two runs over the same data must agree; how many scans get dropped
+otherwise depends on the replay rate and on host load. With
+`drop_stale_scans: false` (in all `pipelines/*.yaml`):
+
+- `submitReadyLidarScanToWorker()` waits for `worker_lidar_.pendingTasks() == 0`
+  instead of letting `POLICY_DROP_OLD` evict the queued scan, so the producer is
+  throttled to the pipeline's own rate.
+- `releaseLidarScansToWorker()` submits **every** ready scan in order, not only
+  the newest.
+- The `max_lidar_queue_before_drop` trim of the IMU wait list is skipped.
+
+`mola-lidar-odometry-cli` defaults it to false (`setenv(..., 0)`, so an explicit
+setting still wins), like `MOLA_ASYNC_BACKEND`. For `mola-cli` replays set it in
+the environment; note `time_warp_scale` above ~5 outruns the pipeline, and
+without this the excess simply becomes dropped scans.
+
+## Local-map publishing is OFF in the offline CLI (`MOLA_PUBLISH_LOCAL_MAP`)
+
+`doPublishUpdatedLocalMap()` deep-copies the whole local map, and it
+deliberately does NOT check `anyUpdateMapSubscriber()`: a subscriber arriving
+late should still receive a map, which matters for latched ROS topics. That
+trade is right for a live node and wrong for a batch run, where no subscriber
+ever appears and the copy sits on the critical path under the state mutex.
+Measured on a 136 m scene: 133 calls at 610 ms mean, 81 s, about 7% of the run.
+
+`publish_local_map` (all `pipelines/*.yaml`, `local_map_updates` block)
+defaults to **true**, and `mola-lidar-odometry-cli` defaults it to false with
+`setenv(..., 0)` so an explicit setting still wins, like `MOLA_ASYNC_BACKEND`
+and `MOLA_DROP_STALE_SCANS`. Set `MOLA_PUBLISH_LOCAL_MAP=true` if a `--module`
+in the same process consumes the map. Geo-referencing publication is
+unaffected: it happens before this gate.
+
 ## Adaptive-threshold sustained-failure recovery is ON by default
 
 `recover_on_sustained_failure` (all `pipelines/*.yaml`, `adaptive_threshold`
@@ -222,6 +399,17 @@ defaults let that gap grow large enough that once the search window finally
 reopened, ICP locked onto a self-consistent but WRONG registration (a
 sudden ~30-40 deg yaw error that then persisted for the rest of the run,
 instead of a brief quality dip that recovers to the true pose).
+
+## `ESTIMATED_OBSERVATION_RADIUS` is fed back through the range filter
+
+The radius is an EMA updated from the first non-empty point layer of the
+**filtered** observation, and that filtering clips at
+`1.2*ESTIMATED_OBSERVATION_RADIUS` (L-infinity cube, `blocks/deskew-early.yaml`).
+So it can only grow by a few percent per scan. When the scene outgrows it
+faster (a drone taking off from 3 m ranges at ~7 m/s), every point is cut and
+the radius could never update again: permanent `NoPairings`. When no filtered
+layer yields a radius, `processLidarScan()` now updates it from the raw scan
+instead; behavior is unchanged whenever any filtered layer has points.
 
 
 ## Local-map locking: `state_mtx_` vs `local_map_content_mtx_`
@@ -285,6 +473,11 @@ The IMU samples a scan sees are therefore a function of the timestamps alone,
 never of how the sensor callbacks interleaved, which is what makes two identical
 offline runs produce identical trajectories. `mola_state_estimation_simple`
 buffers IMU readings the same way for the same reason.
+
+`consumePendingImu()` shares one output map across all the samples it feeds
+to `obs_generators`: a generator with a custom map definition creates its
+(empty) target layer on every call, which with a fresh map per sample cost
+~250 us per IMU reading (65% of a core with a 2.5 kHz IMU).
 
 Limits: the gate only engages after the first IMU reading, so scans preceding it
 are processed straight away. Reproducibility also assumes no scan is dropped for
@@ -422,6 +615,99 @@ over multiple frames. Two consequences for pipeline tuning:
 See `mola-cli-launchs/lidar_odometry_from_botanicgarden_livox.yaml` for a
 complete example with all three env vars set.
 
+## `pipelines/blocks/`: the 3D pipelines are assembled from blocks
+
+`lidar3d-{gicp,icp,ndt}.yaml` are short files whose root `$import:` lists
+`blocks/*.yaml`, one per concept (inputs, runtime, acceptance, adaptive
+threshold, simplemap, visualization, initial localization, ICP, local map,
+observations, de-skew), each entry written as
+`${MOLA_LO_BLOCK_<NAME>|blocks/<file>.yaml}` so a user can swap one block for
+their own file. Blocks merge in list order and the pipeline file's own keys win.
+Shared blocks are used by all three; `icp-*`, `localmap-*` and `observations-*`
+have one file per method and share the env var name (`MOLA_LO_BLOCK_ICP`, ...).
+A shared block adopted by icp/ndt may only add keys equal to the C++ defaults;
+real per-pipeline values are restated in the pipeline file (see `lidar3d-ndt.yaml`'s
+`visualization` overrides). Lists merge wholesale, so every list-valued key
+must live in exactly one block. `lidar2d.yaml` and `extras/` stay standalone.
+`test_pipelines_load` resolves every shipped pipeline and checks a block
+override via its env var.
+
+To check a refactor of these files, resolve each pipeline with
+`mola-yaml-parser` before and after, load both into a canonical form (parsed,
+keys sorted: `$import` reorders keys) and diff; do it also with a few `MOLA_*`
+variables set, since `$define`/override changes only show once resolved.
+
+## `pipelines/*.yaml` hygiene: `$import` over full copies
+
+`mola_yaml` (>=3.0.0) supports `$import: <file>` (deep-merge a base file, sibling
+keys override it) and `$define: {VAR: value}` (rebind a `${VAR|default}` hook for
+the whole imported subtree; see `mola_yaml`'s README/tests). Every pipeline that
+is a small delta over `lidar3d-gicp.yaml`/`-icp.yaml`/`-ndt.yaml` is written as an
+overlay: `default-voxelavg`, `icp-blend`, `ndt-blend`, `fastlio-matching`, and
+`gicp-dual-tsdf` (see their own sections below/above) all just `$import` the base
+and restate only the block that actually changes -- a `$define` when the base
+already exposes the knob as a `${VAR|default}` hook, a sibling key otherwise.
+Whole-file copies rot silently: a hand-kept-in-sync duplicate falls behind every
+feature the base gains later (this is why several older variants had drifted
+years out of date -- missing IMU gravity correction, tf-tree viz, diagnostics --
+before being converted), and nobody notices until someone diffs the two by hand.
+
+Before adding a new pipeline file, or when tempted to `cp` an existing one:
+
+- If the difference is expressible as one or a few `${VAR}` overrides, or as
+  restating one map/matcher/filter list entry, write it as `$import` + `$define`
+  (or a small sibling override), not a full copy. `$import`'s deep-merge only
+  replaces sequences (a matcher list, a layer list) wholesale, not element-wise,
+  so overriding one matcher still means restating that whole list -- still far
+  smaller than the whole file.
+- A one-off ablation/benchmark config (answering "does axis X matter for
+  dataset Y") belongs in that benchmark's own write-up (with the exact
+  `$import`+`$define` recipe to reproduce it), not as a committed file under
+  `pipelines/`. `git log` and the benchmark doc keep the record; a committed
+  YAML nobody imports from just accumulates.
+- Before trusting a new overlay, resolve both the old and new file with
+  `mola-yaml-parser` (built by `mola_launcher`) and diff the two: any surviving
+  difference should be exactly the change you intended (plus inert comment/
+  key-ordering noise from the merge, which drops file-level header comments and
+  the odd trailing inline comment -- harmless, since neither reaches the
+  running config).
+
+## `pipelines/lidar3d-ndt-blend.yaml`
+
+Same as `lidar3d-ndt.yaml` except that `mp2p_icp::Matcher_Point2Plane` is replaced
+by `mp2p_icp::Matcher_NDT_Blend`, which blends the neighboring cell Gaussians
+instead of keeping the closest one. Generated from the baseline with
+`replace_block()` and diff-verified, so the two files differ only in that block.
+
+`MOLA_NDT_BLEND_TEMPERATURE` defaults to `0`, which reproduces `lidar3d-ndt.yaml`
+bit for bit; raising it smooths the residual. `MOLA_NDT_BLEND_SEARCH_RADIUS`
+defaults to the same expression as the map's own voxel size, because a blending
+radius below the cell size leaves no neighboring cell able to contribute at all.
+
+## `pipelines/lidar3d-gicp-dual-tsdf.yaml`
+
+Same as `lidar3d-gicp.yaml` plus a second local-map layer, `tsdf`
+(`mola::TSDF`), matched point-to-plane alongside the point map's cov-to-cov
+block. Both matchers feed one pairing set and `Solver_GaussNewton` sums both
+blocks into a single normal equation.
+
+The one knob is `MOLA_PAIRW_PT2PL` (default `1000.0`), the solver's
+`pair_weights.pt2pl`. It is an **inverse variance**, not a relative share: the
+cov-to-cov block already carries ~500 per pairing from its `(1, 1, 1e-3)`
+surface regularization, so leaving this at `1.0` makes the field block a few
+tenths of a percent of the information and reproduces `lidar3d-gicp.yaml`. The
+per-layer `weight` key inside a matcher's layer list is a legacy no-op in
+mp2p_icp and cannot be used for this. The `MOLA_TSDF_*` variables tune the
+field itself and are documented in the YAML, `MOLA_TSDF_POINT_SIZE` /
+`MOLA_TSDF_COLORMAP` / `MOLA_TSDF_COLOR_BY` / `MOLA_TSDF_RENDER_AS_MESH` its
+rendering (the last one draws a marching-tetrahedra surface instead of points:
+for figures, not for a live run).
+
+Measured on 13 Oxford Spires sequences against `lidar3d-gicp.yaml` under the
+same profile: pooled vertical drift +1.415 -> +0.166 mm/m (13/13 sequences
+better), per-segment tilt drift better on 11/13, median APE 0.142 -> 0.117 m,
+at about +21% per scan.
+
 ## `pipelines/lidar3d-gicp-single-filter.yaml` (temporary test variant)
 
 Same as `lidar3d-gicp.yaml`, except that the two chained `FilterDecimateAdaptive`
@@ -431,19 +717,31 @@ parameter. Voxelizing is the dominant cost, so the second stage becomes
 essentially free (~2 ms/scan on a 100k-point cloud).
 
 One parameter does NOT survive the fold, and the fold-back has to reconcile it:
-the chained "icp" stage had its own `voxel_size` (default 0.10), while a single
-filter has only one grid, `${MOLA_CLOUD_DECIMATION_VOXEL_SIZE|0.15}`. So the ICP
-cloud is now sampled from the 0.15 m grid over the full scan rather than from a
-0.10 m grid over the already-decimated map cloud. (Both stages always read that
-same env var, so only the two defaults ever differed.)
+the chained "icp" stage has its own `voxel_size`
+(`${MOLA_CLOUD_DECIMATION_VOXEL_SIZE_ICP|0.10}`), while a single filter has only
+one grid (`${MOLA_CLOUD_DECIMATION_VOXEL_SIZE_MAP|0.15}`). So the ICP cloud is
+sampled from the 0.15 m grid over the full scan rather than from a 0.10 m grid
+over the already-decimated map cloud.
 
-It lives in a separate file
+The two stages are separately settable since 2026-08-15; before that, one
+`MOLA_CLOUD_DECIMATION_VOXEL_SIZE` drove both and only the defaults differed.
+That name is retired and now has no effect -- set both of the above to
+reproduce a run recorded against it. The stages were split because they want
+different cell sizes: measured on KITTI, a coarse map voxel wins from 400 m of
+travel onward while a finer one wins at 100-300 m, so a single value cannot
+express both drift accumulation and short-range precision.
+
+It is an overlay that `$import`s `lidar3d-gicp.yaml` and replaces only
+`observations_filter_1st_pass`. It lives in a separate file
 only because `outputs` needs an mp2p_icp newer than the current release; fold it
 back into `lidar3d-gicp.yaml` and delete it once mp2p_icp is re-released. It is
-deliberately NOT wired into `test/CMakeLists.txt`, which must keep building
-against the released mp2p_icp.
+deliberately NOT run by any test in `test/CMakeLists.txt`, which must keep
+building against the released mp2p_icp (`test_pipelines_load` only resolves
+its YAML, which instantiates no filter).
 
-## Selectable local-map class in `pipelines/lidar3d-gicp.yaml`
+## Selectable local-map class in the GICP pipeline
+
+(`pipelines/blocks/localmap-gicp.yaml` and `observations-gicp.yaml`.)
 
 `${MOLA_LOCALMAP_CLASS|mola::KeyframePointCloudMap}` picks the class used for
 both the `localmap` layer and the `observation` (scan) layer -- `Matcher_Cov2Cov`
@@ -460,9 +758,13 @@ a single YAML enough. When adding keys, keep KFM's *required* ones
   self-balancing k-d tree, no per-scan tree rebuild. **Odometry only** (a global
   SE(3) re-map would force a full rebuild). Tuned by `MOLA_INCREMENTAL_MAP_*`:
   `MAX_SIZE` (eviction cube **half-side** [m] -- a much tighter budget than KFM's
-  `remove_frames_farther_than`, which is a radius over keyframe centres),
+  `remove_frames_farther_than`, which is a radius over keyframe centres; its
+  100 m floor is a long-range-sensor safety net, and on a short-range or indoor
+  capture the whole trajectory fits inside it, so nothing is ever evicted and
+  the local map silently becomes a global one -- set it explicitly there),
   `ASYNC_REBUILD` (default `true`; moves the k-d tree rebuilds off the mapping
-  thread and is what keeps insertion latency flat), `ALPHA_BALANCE`,
+  thread and is what keeps insertion latency flat; nondeterministic, so
+  `mola-lidar-odometry-cli` defaults it to `false`), `ALPHA_BALANCE`,
   `ALPHA_DELETED`, `RESERVE_POINTS`.
 
 `mola::IncrementalPointCloud` needs `mola_metric_maps` built against
@@ -498,16 +800,55 @@ biases verticality for the whole run.
 `imu_gravity_correction.map_gravity.enabled` replaces it with
 `mola::imu::MapGravityEstimator`, which solves for gravity in the map frame from
 preintegrated IMU plus this odometry's own relative attitudes and velocities;
-its earned pitch/roll sigma is added in quadrature to the prior's, so a weak
-estimate silences itself. There is no quality threshold anywhere in that path,
-by design: the library reports every usable estimate with its sigma and the
-weighting decides (see `mola_imu_preintegration/agents.md`).
+its earned pitch/roll sigma is added in quadrature to the prior's. There is no
+quality threshold anywhere in that path, by design: the library reports every
+usable estimate with its sigma and the weighting decides (see
+`mola_imu_preintegration/agents.md`). Do NOT read those sigmas as a confidence
+gate, though: measured on a handheld dataset the error/sigma ratio is 8.4
+median and 19.0 worst, so "a weak estimate silences itself" is not established.
 
 `map_gravity.log_only` computes and logs the estimate without letting it reach
 the verticality reference, so the trajectory is identical to a disabled run.
 That is the mode to validate the estimator on a new dataset: with the feedback
 loop closed, the map frame being estimated is partly the estimator's own doing,
 and scoring it against ground truth would be self-referential.
+
+## Re-leveling the map frame (`map_gravity.relevel_map_frame`)
+
+All of the above corrects the per-scan *prior*; the map frame itself stays
+where it started, which is the initial body frame, tilt included. On a handheld
+dataset that is a median 8.7 deg lean (max 20.7) baked into every map product
+for the whole run. `relevel_map_frame` (default **false**) rotates the map
+frame once, about the map origin, by the estimator's `Result::correction`.
+
+It is a **gauge change**, not a state update, and must stay one:
+`MapFrameRelevel.h` applies `p -> b + p` to the local map, the simplemap, the
+trajectory; `KeyframeDecider`/`SearchablePoseList::transform_left_multiply()`
+move the keyframe-density bookkeeping with them; and
+`NavStateFilter::transform_frame()` does the same inside the state estimator.
+Anything expressed in the *vehicle* frame (twists, sensor extrinsics) is
+invariant and must not be touched. The decision is taken in
+`evaluateMapFrameRelevel()` and applied by `applyMapFrameRelevel()`, which runs
+outside `imu_state_mtx_` because the lock order forbids taking the local-map and
+simplemap mutexes under it. It fires before the scan reaches either map, and
+refuses outright once a map has been loaded or geo-referenced.
+
+Two things about the trigger that are easy to get wrong:
+
+- **It is not `min_intervals_for_convergence`.** That gates the per-scan prior,
+  where the later, settled estimate is the useful one. For leveling the map once
+  the estimate is at its *best* at the first solve (0.72 deg at ~5.6 s) and
+  degrades from there, so `relevel_min_intervals` is deliberately tiny (5 = the
+  first solve).
+- **The magnitude gate is load-bearing.** The correction's residual is the
+  estimator's own error (0.63 deg median, 1.43 p90, 1.75 worst at the firing
+  point), so on an already-level start it makes things worse. The gate tests the
+  estimate while the quantity that must be large is the truth, and they differ
+  by that error, hence `relevel_min_tilt_deg` ~ 2x the p90, not 1x.
+
+The applied rotation is logged once at INFO and written to the local map's
+`metadata` and to every later keyframe's metadata observation, since a run with
+a re-leveled map frame is not pose-comparable with one without it.
 
 ## Reproducible odometry evaluation
 
@@ -520,11 +861,76 @@ Trajectory-to-trajectory comparisons are only meaningful under all of:
   scheduling changes the result. Pinning makes runs bit-identical; check with
   `md5sum` on the output `.tum` before comparing anything.
 - **`MOLA_ASYNC_BACKEND=false`** when using the smoother state estimator (its
-  async serving path is non-deterministic).
+  async serving path is non-deterministic). `mola-lidar-odometry-cli` now
+  defaults it to false itself (it is a batch tool with no real-time deadline,
+  and with no clock pacing the front end outruns the backend by construction),
+  so this only needs stating for other offline entry points. Measured
+  accuracy-neutral over 49 sequences before being adopted, so it buys
+  reproducibility rather than accuracy.
 
 The smoother also needs `-l <libmola_state_estimation_smoother.so>`; the CLI
 does not load that plugin by default and the class factory otherwise fails with
 "unknown class name".
+
+## A second front-end in the batch CLI: `--module`
+
+`mola-lidar-odometry-cli` can run arbitrary extra MOLA modules alongside the
+LiDAR odometry, so a two-front-end system (say LiDAR + visual odometry, both
+fused in the smoother) can be evaluated in the deterministic batch tool instead
+of `mola-cli`. Two repeatable options paired up in order, mirroring
+`--state-estimator` / `--state-estimator-param-file`:
+
+```
+mola-lidar-odometry-cli -c pipeline.yaml \
+  -l libmola_state_estimation_smoother.so,libmola_visual_slam.so \
+  --state-estimator mola::state_estimation_smoother::StateEstimationSmoother \
+  --state-estimator-param-file se.yaml \
+  --module mola::VisualSlam --module-param-file vo.yaml \
+  --input-kitti-seq 00 --output-tum-path out.tum
+```
+
+Notes:
+
+- The class is instantiated through `mrpt::rtti::classFactory`, so its `.so`
+  must be in `-l`. No build dependency is added to this package.
+- All modules go into the same `MinimalModuleContainer` **before** any
+  `initialize()`, since that is where a module resolves the services it needs
+  (a front-end looking up the `NavStateFilter`, for instance).
+- Extra modules receive **every** observation of each dataset entry, not just
+  the one the LiDAR odometry consumes, and they receive it *before* the LiDAR
+  odometry, so what they contribute to the state estimator is already there when
+  the LiDAR odometry asks it for a motion prior.
+- A module must do its work in `onNewObservation()`. There is no spin thread
+  here; `mola::VisualSlam` is synchronous by design and therefore deterministic.
+- Sensors the LiDAR odometry ignores are not published by default. `--module`
+  switches KITTI's `publish_image_0/1` on; for rosbags, name the topics with
+  `MOLA_CAMERA_TOPIC_0` / `MOLA_CAMERA_TOPIC_1` (labels `image_0` / `image_1`,
+  overridable with `MOLA_CAMERA_LABEL_0/1`), same empty-by-default convention as
+  `MOLA_ODOMETRY_TOPIC`.
+- A second front-end that pushes poses under its **own** frame id adds a frame
+  variable to the smoother's factor graph, which is gauge-free on the first
+  solves: without an anchor GTSAM throws `IndeterminantLinearSystem` on it and
+  the run dies at scan 1. Set `MOLA_LINK_FIRST_POSE_SIGMA=1e-6`. Not specific
+  to `--module`, but this is where it is first hit.
+
+Measured on KITTI 00's first 300 scans: two pinned runs of LiDAR + stereo VO
+are bit-identical to each other and to an unpinned run, and `no_motion_model`
+falls from 6 (2.01%) to 1 (0.33%) with the visual source present.
+
+
+**Run totals at shutdown.** Every run now logs one INFO line before saving:
+
+```
+Run totals: registrations=N no_motion_model=K (x.xx%) icp_rejected=M (y.yy%)
+```
+
+`no_motion_model` counts the scans registered from a **zero-motion initial
+guess**, because the state estimator returned nothing (or a prediction too
+uncertain to pass `min_motion_model_xyz_cov_inv`). The front end has always
+logged a warning for that, but throttled, so it could not be counted: an
+estimator silently failing on 1 scan in 20 looked exactly like one that never
+failed. Read it next to `scan_drop_pct`; a nonzero value means part of the
+trajectory was registered without a motion prior, whatever the APE says.
 
 Always characterize the run-to-run noise floor (the same config twice) before
 believing a difference between two configs, and confirm the estimate covers the
@@ -533,7 +939,14 @@ full ground-truth timespan.
 Ready-made rig for Oxford Spires (`StateEstimationSimple`, deterministic):
 `~/lo-gravity-eval/{oxford_env.sh,run_oxford.sh,eval_tum.py,analyze_map_gravity.py}`.
 The bags carry no `/tf`, so the sensor extrinsics must be passed as the fixed
-poses the env script sets, and the sensor labels are the topic names.
+poses the env script sets, and the sensor labels are the topic names — or use
+`mola-lo-cli-oxford-spires`, which sets exactly those from the profile.
+
+`eval/cli_*.sh` are batch sweeps, not launchers: they choose sequences,
+parallelism and metrics, and hand the launching to `mola-lo-cli-<dataset>`.
+Anything a sweep pins deliberately (KITTI's `MOLA_INITIAL_VX`, which differs
+from the interactive default) is set there explicitly and commented, since a
+sweep's numbers are only comparable to its own history.
 
 ## Environment Variables (Debug/Tracing Flags)
 
@@ -545,9 +958,29 @@ pipeline YAML, not read directly in C++.)
 
 | Variable | Type | Default | Location | Purpose |
 |----------|------|---------|----------|---------|
+| `MOLA_MATCH_THRESHOLD_FAR` | double | 0 (off) | `pipelines/lidar3d-gicp.yaml` | Range-adaptive matching distance: matching distance beyond `..._KNEE`. 0 keeps the flat `threshold`, bit-identical to before. Interacts with `adaptive_threshold.initial_sigma`/`min_motion` and is a no-op at sigma 0.5 -- do not sweep it alone |
+| `MOLA_MATCH_THRESHOLD_KNEE` | double | 15.0 | `pipelines/lidar3d-gicp.yaml` | Range [m] where the near/far transition is centred |
+| `MOLA_MATCH_THRESHOLD_WIDTH` | double | 5.0 | `pipelines/lidar3d-gicp.yaml` | Width [m] of the near/far logistic transition |
+| `MOLA_LOCALMAP_MAX_PLANE_DEV_FOR_COV` | double | 0 (off) | `pipelines/lidar3d-gicp.yaml` | Map-side planarity gate: reject a covariance neighborhood, falling back to isotropic, when any of its `k` neighbors lies farther than this [m] from their least-squares plane. Measured best at 0.20 on KITTI; 0 is the shipped behavior |
+| `MOLA_OBSLAYER_MAX_PLANE_DEV_FOR_COV` | double | 0 (off) | `pipelines/lidar3d-gicp.yaml` | Same gate, scan side. Gating both sides was measured worse than the map side alone on KITTI |
+| `MOLA_LOCALMAP_PLANE_REG_LAMBDA` | double | 0.001 | `pipelines/lidar3d-gicp.yaml` | Variance asserted along the estimated surface normal, i.e. the plane-confidence ratio (0.001 == 1000:1). **Not a tuning knob**: raising it measured monotonically worse on KITTI |
+| `MOLA_OBSLAYER_PLANE_REG_LAMBDA` | double | 0.001 | `pipelines/lidar3d-gicp.yaml` | Idem, scan side |
+| `MOLA_LOCALMAP_MIN_NEIGHBORS_TO_CACHE_COV` | int | 0 (= `k`) | `pipelines/lidar3d-gicp.yaml` | `mola::IncrementalPointCloud` only: neighbors a point must have been found with for its covariance to enter the cache, so a thin-neighborhood estimate (in particular the isotropic fallback) is not frozen for the point's whole life. 1 caches everything, the behavior before it existed. ATE-neutral over seven sequences at a runtime cost inside the run-to-run spread. Do not pair with a narrow `MAX_DISTANCE_FOR_COV`: k neighbors inside a small radius is rarely satisfiable, so the cache stops admitting and every query re-searches |
+| `MOLA_GCW_ENABLED` | bool | false | `pipelines/lidar3d-gicp.yaml` | Enables mp2p_icp's per-pairing weight by map surface geometry class. Inert while the weights are all ones |
+| `MOLA_GCW_VARIABLE` | string | `incidence` | `pipelines/lidar3d-gicp.yaml` | `incidence` (gravity-free) or `verticality` (needs a gravity source) |
+| `MOLA_GCW_GRAVITY_SOURCE` | string | `map_frame` | `pipelines/lidar3d-gicp.yaml` | `imu` or `map_frame`, for `verticality` only |
+| `MOLA_GCW_SOFTNESS` | double | 10.0 | `pipelines/lidar3d-gicp.yaml` | Ramp width at the breakpoint, in the units of the class variable |
+| `MOLA_GCW_BREAKPOINT` | double | 60.0 | `pipelines/lidar3d-gicp.yaml` | Single class boundary: degrees for `incidence`, \|n.up\| for `verticality` |
+| `MOLA_GCW_W_LOW` / `MOLA_GCW_W_HIGH` | double | 1.0 / 1.0 | `pipelines/lidar3d-gicp.yaml` | Weights below/above the breakpoint. Both 1.0 is a no-op |
 | `MOLA_DEBUG_DUMP_ICP_LOG_FROM_TIMESTAMP` | double | 0 | `module/src/LidarOdometry_ProcessScan.cpp` | Start of a timestamp range for forcing ICP debug-log dumps (paired with `..._TO_TIMESTAMP`) |
 | `MOLA_DEBUG_DUMP_ICP_LOG_TO_TIMESTAMP` | double | 0 | `module/src/LidarOdometry_ProcessScan.cpp` | End of the timestamp range above |
 | `MOLA_LO_DEBUG_ICP_QUALITY` | bool | false | `module/src/LidarOdometry_ProcessScan.cpp` | Trace ICP quality metrics per scan |
+| `MOLA_ICP_PRIOR_WEIGHT` | double | 1.0 (no change) | `pipelines/lidar3d-gicp.yaml` | Multiplies the information matrix of the pose prior handed to the ICP solver. The prior is one residual against as many residuals as there are pairings, so at unit weight it breaks ties rather than constraining anything. Raise it where the motion source is worth more than a single point pairing |
+| `MOLA_MAX_REGISTRATION_MAHALANOBIS` | double | 0 (off) | `pipelines/lidar3d-gicp.yaml` | Largest distance, in sigmas of the state estimator's predicted pose covariance, that a registration may sit from that prediction and still be accepted. Only meaningful if the estimator reports an honest covariance: a filter whose covariance is dominated by a constant floor can make the statistic poorly reflect the actual prediction error. A rejection here does not count as a bad ICP, so it cannot trigger the sustained-failure recovery path |
+| `MOLA_LO_REG_GATE_LOG` | string | (empty = off) | `module/src/LidarOdometry_ProcessScan.cpp` | Path to a TSV dump, one row per scan: correction, predicted and ICP sigmas, and the Mahalanobis statistic, for choosing the threshold above from data. Same idiom as `MOLA_LO_MAP_GATE_LOG` |
+| `MOLA_DROP_STALE_SCANS` | bool | true | all `pipelines/*.yaml` | false = lossless input queue (producer blocks instead of the queue evicting the older scan). `mola-lidar-odometry-cli` defaults it to false |
+| `MOLA_CAMERA_TOPIC_0` / `_1` | string | (empty = off) | `apps/mola-lidar-odometry-cli.cpp` | Rosbag camera topics to publish, for a `--module` front-end |
+| `MOLA_CAMERA_LABEL_0` / `_1` | string | `image_0` / `image_1` | `apps/mola-lidar-odometry-cli.cpp` | Sensor labels for the topics above |
 | `LO_PIPELINE_YAML` | string | (unset) | `test/test_lidar_odometry_rawlog.cpp`, `test/test_lidar_odometry_rosbag2.cpp` | Path to the LO pipeline YAML used by the test |
 | `LO_STATE_ESTIM_YAML` | string | (unset) | same tests | Path to the state-estimator YAML used by the test |
 | `LO_TEST_RAWLOG` | string | (unset) | `test/test_lidar_odometry_rawlog.cpp` | Path to the input rawlog dataset |

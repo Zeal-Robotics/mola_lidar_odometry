@@ -1,0 +1,30 @@
+# =====================================================================================
+# Pipeline: blended-point 3D ICP with a voxel point-cloud local map
+#
+# Variant of lidar3d-icp.yaml: the nearest-neighbor matcher is replaced by
+# mp2p_icp::Matcher_Points_Blend, which blends the map points in a window
+# instead of selecting the nearest one. Everything else is identical, and the
+# shipped default temperature of 0 reproduces lidar3d-icp.yaml exactly.
+# =====================================================================================
+
+$import: lidar3d-icp.yaml
+
+icp_settings_with_vel:
+  matchers:
+    - class: mp2p_icp::Matcher_Points_Blend
+      params:
+        threshold: "2.0*max(ADAPTIVE_THRESHOLD_SIGMA, 2.0*ADAPTIVE_THRESHOLD_SIGMA-(2.0*ADAPTIVE_THRESHOLD_SIGMA-0.5*ADAPTIVE_THRESHOLD_SIGMA)*ICP_ITERATION/30)"
+        thresholdAngularDeg: 0 # deg
+        # 0 reproduces Matcher_Points_DistanceThreshold with pairingsPerPoint 1
+        # exactly (see lidar3d-icp.yaml). Larger values blend the map points in
+        # the window instead of keeping the nearest one, which makes the target
+        # a smooth function of the pose at the price of a target that is pulled
+        # off the surface toward the interior of the neighborhood.
+        temperature: "${MOLA_PTS_BLEND_TEMPERATURE|0.0}"
+        # Blending window. Tied to the local map's own voxel size, which is the
+        # scale that sets the spacing of the points being blended:
+        searchRadius: "${MOLA_PTS_BLEND_SEARCH_RADIUS|max(0.5, min(1.0, 0.015*ESTIMATED_OBSERVATION_RADIUS))}"
+        smoothCutoff: ${MOLA_PTS_BLEND_SMOOTH_CUTOFF|true}
+        allowMatchAlreadyMatchedGlobalPoints: true # faster
+        pointLayerMatches:
+          - { global: "${MOLA_LOCALMAP_LAYER_NAME|localmap}", local: "decimated_for_icp", weight: 1.0 }

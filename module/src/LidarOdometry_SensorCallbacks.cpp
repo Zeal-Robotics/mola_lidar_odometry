@@ -29,9 +29,13 @@
 #include <mrpt/obs/CObservationGPS.h>
 #include <mrpt/obs/CObservationIMU.h>
 #include <mrpt/obs/CObservationOdometry.h>
+#include <mrpt/obs/CObservationRobotPose.h>
 
 // Std:
+#include <chrono>
+#include <mutex>
 #include <regex>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -101,6 +105,24 @@ void LidarOdometry::onNewObservation(const CObservation::ConstPtr & o)
     onIMU(o);
   }
 
+  // Is it the odometry source whose absolute attitude provides the verticality
+  // reading? Handled inline for the same reason as the IMU above: it only
+  // stores the newest value, so doing it on the caller's thread keeps what a
+  // scan sees a function of the input sequence rather than of scheduling.
+  if (
+    params_.imu_gravity_correction.odometry_attitude.enabled &&
+    o->sensorLabel == params_.imu_gravity_correction.odometry_attitude.sensor_label) {
+    onOdometryAttitude(o);
+  }
+
+  // Is it the odometry source for de-skew velocities? Inline, for the same
+  // reason as the IMU above.
+  if (
+    params_.deskew_odometry_sensor_label &&
+    o->sensorLabel == params_.deskew_odometry_sensor_label.value()) {
+    onDeskewOdometry(o);
+  }
+
   // Is it GNSS?
   if (
     params_.gnss_sensor_label &&
@@ -124,6 +146,89 @@ void LidarOdometry::onNewObservation(const CObservation::ConstPtr & o)
 
     break;  // do not keep processing the list
   }
+
+  MRPT_TRY_END
+}
+
+void LidarOdometry::onDeskewOdometry(const CObservation::ConstPtr & o)
+{
+  mrpt::poses::CPose3D pose;
+  if (const auto rp = std::dynamic_pointer_cast<const mrpt::obs::CObservationRobotPose>(o); rp) {
+    // Same sensor-to-vehicle correction as the state estimators apply:
+    pose = rp->pose.mean + (-rp->sensorPose);
+  } else if (const auto od = std::dynamic_pointer_cast<const mrpt::obs::CObservationOdometry>(o);
+             od) {
+    pose = mrpt::poses::CPose3D(od->odometry);
+  } else {
+    MRPT_LOG_THROTTLE_WARN_FMT(
+      5.0,
+      "deskew_odometry_sensor_label='%s' matched an observation of class '%s', which is neither "
+      "CObservationRobotPose nor CObservationOdometry. Ignoring it.",
+      o->sensorLabel.c_str(), o->GetRuntimeClass()->className);
+    return;
+  }
+
+  // A few seconds of history is plenty: sweeps are ~0.1 s long.
+  constexpr double HISTORY_SECONDS = 5.0;
+
+  const double t = mrpt::Clock::toDouble(o->timestamp);
+
+  auto lckImu = mrpt::lockHelper(imu_state_mtx_);
+  auto & poses = state_.deskew_odometry_poses;
+  poses[t] = pose;
+  while (!poses.empty() && poses.begin()->first < poses.rbegin()->first - HISTORY_SECONDS) {
+    poses.erase(poses.begin());
+  }
+}
+
+void LidarOdometry::onOdometryAttitude(const CObservation::ConstPtr & o)
+{
+  MRPT_TRY_START
+
+  const auto obs = std::dynamic_pointer_cast<const mrpt::obs::CObservationRobotPose>(o);
+  if (!obs) {
+    MRPT_LOG_THROTTLE_WARN_FMT(
+      5.0,
+      "Observation '%s' is configured as the odometry attitude source but is not a "
+      "CObservationRobotPose, so it carries no 3D attitude. Ignoring it.",
+      o->sensorLabel.c_str());
+    return;
+  }
+
+  // Move the reading from the sensor to the vehicle frame, as the state
+  // estimator does for the same observation.
+  auto pose = obs->pose.mean;
+  if (obs->sensorPose != mrpt::poses::CPose3D()) {
+    pose = pose + (-obs->sensorPose);
+  }
+
+  // Only the vertical is taken. Writing R = R_odom_vehicle, the source frame's
+  // "up" in vehicle coordinates is R^T * [0,0,1], i.e. R's third row. The
+  // source frame and the map frame differ by an unknown yaw and translation,
+  // and a rotation about the vertical leaves the vertical fixed, so this one
+  // direction transfers between them exactly while the position and the
+  // heading do not.
+  const auto R = pose.getRotationMatrix();
+  const auto up = mrpt::math::TVector3D(R(2, 0), R(2, 1), R(2, 2));
+
+  const double n = up.norm();
+  if (n < 1e-6) {
+    return;
+  }
+
+  const double stamp = mrpt::Clock::toDouble(obs->timestamp);
+
+  auto lckImu = mrpt::lockHelper(imu_state_mtx_);
+
+  // Readings can arrive out of order. Letting an older one land would move the
+  // vertical backwards and, with no age limit configured, keep it there.
+  if (state_.odom_attitude.valid && stamp < state_.odom_attitude.timestamp) {
+    return;
+  }
+
+  state_.odom_attitude.up_body = up * (1.0 / n);
+  state_.odom_attitude.timestamp = stamp;
+  state_.odom_attitude.valid = true;
 
   MRPT_TRY_END
 }
@@ -186,12 +291,15 @@ void LidarOdometry::sendLidarScanToProcessQueue(const CObservation::ConstPtr & o
 
     // Safety cap: if IMU data lags badly, keep the wait list from growing without
     // bound by dropping the oldest still-waiting scans (they would be the most
-    // stale ones anyway):
-    const auto nDropped =
-      worker_lidar_wait_for_imu_list_.trim_to(params_.max_lidar_queue_before_drop);
-    for (std::size_t i = 0; i < nDropped; i++) {
-      addDropStats(true);
-      profiler_.registerUserMeasure("onNewObservation.drop_observation", 1);
+    // stale ones anyway). Skipped in lossless mode, where the producer is
+    // throttled at submit time and the list is bounded by the IMU lag alone:
+    if (params_.drop_stale_scans) {
+      const auto nDropped =
+        worker_lidar_wait_for_imu_list_.trim_to(params_.max_lidar_queue_before_drop);
+      for (std::size_t i = 0; i < nDropped; i++) {
+        addDropStats(true);
+        profiler_.registerUserMeasure("onNewObservation.drop_observation", 1);
+      }
     }
     waitListSize = worker_lidar_wait_for_imu_list_.size();
   }
@@ -231,6 +339,16 @@ void LidarOdometry::releaseReadyLidarScansToWorker()
 
 std::future<void> LidarOdometry::releaseLidarScansToWorker(const double upToImuTime)
 {
+  // In lossless mode the lock is taken BEFORE the scans leave the wait list and
+  // held until the last of them is enqueued: taking it any later would let a
+  // concurrent caller remove a newer batch and submit it ahead of this one, so
+  // the worker would see the scans out of chronological order. The default mode
+  // has nothing to serialize, since the pool's own policy is the intent there.
+  std::unique_lock<std::mutex> losslessLock;
+  if (!params_.drop_stale_scans) {
+    losslessLock = std::unique_lock<std::mutex>(lossless_submit_mtx_);
+  }
+
   // Collect every waiting scan whose whole span is already covered by received
   // IMU data, in chronological order, then submit outside the wait-list lock:
   const std::vector<ScanImuWaitList::Entry> readyScans = [&]() {
@@ -238,13 +356,24 @@ std::future<void> LidarOdometry::releaseLidarScansToWorker(const double upToImuT
     return worker_lidar_wait_for_imu_list_.take_ready(upToImuTime);
   }();
 
-  // On an IMU catch-up burst several scans can qualify at once, but only the
-  // newest matters ("keep freshest"): drop-account the older ones directly
-  // instead of submitting each only to have it superseded by the next.
   if (readyScans.empty()) {
     return {};  // an invalid future: nothing was submitted
   }
 
+  if (!params_.drop_stale_scans) {
+    // Submit every scan that became ready, in chronological order. Each submit
+    // below blocks until the worker is free, so none can be superseded by the
+    // next one either.
+    std::future<void> last;
+    for (const auto & e : readyScans) {
+      last = submitLidarScanLossless_locked(e.obs, e.imu_coverage_end_time);
+    }
+    return last;
+  }
+
+  // On an IMU catch-up burst several scans can qualify at once, but only the
+  // newest matters ("keep freshest"): drop-account the older ones directly
+  // instead of submitting each only to have it superseded by the next.
   for (std::size_t i = 0; i + 1 < readyScans.size(); i++) {
     addDropStats(true);
     profiler_.registerUserMeasure("onNewObservation.drop_observation", 1);
@@ -259,15 +388,42 @@ std::future<void> LidarOdometry::submitReadyLidarScanToWorker(
   // worker_lidar_ uses POLICY_DROP_OLD: with a single worker thread, enqueue()
   // itself discards any older, not-yet-started scan once one is already queued
   // behind the one currently running. The pool gives no callback for that
-  // eviction, so detect it here (before enqueueing) purely for the drop-stats
-  // accounting; running scans are never aborted, only queued ones can be
+  // eviction, so a nonzero pendingTasks() here (before enqueueing) is what
+  // detects it; running scans are never aborted, only queued ones can be
   // dropped this way.
+  if (!params_.drop_stale_scans) {
+    auto lck = mrpt::lockHelper(lossless_submit_mtx_);
+    return submitLidarScanLossless_locked(o, imuCoverageEndTime);
+  }
+
   if (worker_lidar_.pendingTasks() > 0) {
+    // The eviction is about to happen: account for it.
     addDropStats(true);
     profiler_.registerUserMeasure("onNewObservation.drop_observation", 1);
     MRPT_LOG_THROTTLE_WARN_FMT(
       1.0, "Dropping LiDAR scan (worker busy: keeping only the freshest); dropped frames: %.02f%%",
       getDropStats() * 100.0);
+  }
+
+  return worker_lidar_.enqueue(
+    &LidarOdometry::onLidar, this, o, mrpt::Clock::nowDouble(), imuCoverageEndTime);
+}
+
+std::future<void> LidarOdometry::submitLidarScanLossless_locked(
+  const CObservation::ConstPtr & o, std::optional<double> imuCoverageEndTime)
+{
+  // Wait for the queue to drain instead of letting POLICY_DROP_OLD evict the
+  // scan already waiting in it, which throttles the producer down to the
+  // pipeline's own rate. That is what a reproducible replay needs.
+  while (worker_lidar_.pendingTasks() > 0) {
+    const bool aborting = [this]() {
+      auto lck = mrpt::lockHelper(is_busy_mtx_);
+      return destructor_called_;
+    }();
+    if (aborting) {
+      return {};
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(500));
   }
 
   return worker_lidar_.enqueue(
@@ -358,6 +514,18 @@ void LidarOdometry::onIMUImpl(const CObservation::ConstPtr & o)
     // Rate stats are pure instrumentation, so they are updated on arrival: they
     // must keep reporting a live IMU even while no scan is being processed.
     state_.append_imu_stamp(imu->timestamp, *this);
+
+    // Keep the latest IMU observations for simplemap insertion. Kept apart
+    // from pending_imu_ above, which is drained as the readings are consumed,
+    // and stored even when that one rejects a late arrival: an out-of-order
+    // reading is still a valid attitude measurement for a keyframe.
+    if (params_.simplemap.save_imu_max_age > 0) {
+      state_.last_imu_.emplace(imu->timestamp, imu);
+
+      while (state_.last_imu_.size() > params_.imu_queue_max_size) {
+        state_.last_imu_.erase(state_.last_imu_.begin());
+      }
+    }
   }
 
   if (!stored) {
@@ -385,6 +553,12 @@ void LidarOdometry::consumePendingImu(const double upToTime)
 {
   auto lckImu = mrpt::lockHelper(imu_state_mtx_);
 
+  // Only the generators' side effect (feeding the de-skew velocity buffer) is
+  // wanted from IMU readings. A generator with a custom map definition still
+  // creates its (empty) target layer on every call, so the output map is
+  // shared by all samples to build that layer at most once.
+  mp2p_icp::metric_map_t dummy_map;
+
   for (const auto & imuPtr : pending_imu_.take_up_to(upToTime)) {
     const auto & imu = *imuPtr;
 
@@ -397,10 +571,7 @@ void LidarOdometry::consumePendingImu(const double upToTime)
     //    LocalVelocityBuffer inside the ParameterSource.
     //    The LocalVelocityBuffer also needs velocity and orientation estimations, which are sent
     //    out in updatePipelineDynamicVariables()
-    {
-      mp2p_icp::metric_map_t dummy_map;
-      mp2p_icp_filters::apply_generators(state_.obs_generators, imu, dummy_map);
-    }
+    mp2p_icp_filters::apply_generators(state_.obs_generators, imu, dummy_map);
 
     // 3) Gravity estimation for ICP verticality correction:
     if (params_.imu_gravity_correction.enabled) {

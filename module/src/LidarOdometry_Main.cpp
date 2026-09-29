@@ -29,20 +29,19 @@
 #include <mrpt/containers/yaml.h>
 #include <mrpt/core/initializer.h>
 #include <mrpt/io/lazy_load_path.h>
-#include <mrpt/maps/CColouredPointsMap.h>
 #include <mrpt/obs/CObservationPointCloud.h>
 #include <mrpt/obs/CRawlog.h>
-#include <mrpt/opengl/CAssimpModel.h>
-#include <mrpt/opengl/CGridPlaneXY.h>
-#include <mrpt/opengl/COpenGLScene.h>
-#include <mrpt/opengl/CText.h>
-#include <mrpt/opengl/stock_objects.h>
 #include <mrpt/poses/CPose3DPDFGaussian.h>
 #include <mrpt/random.h>
 #include <mrpt/system/datetime.h>
 #include <mrpt/system/filesystem.h>
 #include <mrpt/system/string_utils.h>
 #include <mrpt/topography/conversions.h>
+#include <mrpt/viz/CAssimpModel.h>
+#include <mrpt/viz/CGridPlaneXY.h>
+#include <mrpt/viz/CText.h>
+#include <mrpt/viz/Scene.h>
+#include <mrpt/viz/stock_objects.h>
 
 // STD:
 #include <chrono>
@@ -120,6 +119,22 @@ void LidarOdometry::shutdownCleanup()
     worker_others_.clear();
     worker_viz_.clear();
     worker_viz_local_map_.clear();
+
+    // Run totals, once, in a form a harness can scrape. `no_motion_model` is
+    // the number the corpus had no aggregate for: it is the difference between
+    // "the state estimator is helping" and "the front end has been registering
+    // scans from a zero-motion guess", and until now it surfaced only as a
+    // throttled warning line that nothing counted.
+    if (state_.registrations_attempted > 0) {
+      const double pctNoModel =
+        100.0 * state_.registration_no_motion_model / state_.registrations_attempted;
+      const double pctRejected =
+        100.0 * state_.registration_icp_rejected / state_.registrations_attempted;
+      MRPT_LOG_INFO_FMT(
+        "Run totals: registrations=%zu no_motion_model=%zu (%.2f%%) icp_rejected=%zu (%.2f%%)",
+        state_.registrations_attempted, state_.registration_no_motion_model, pctNoModel,
+        state_.registration_icp_rejected, pctRejected);
+    }
 
     if (params_.simplemap.generate) {
       saveReconstructedMapToFile();

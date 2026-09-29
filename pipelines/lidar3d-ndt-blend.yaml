@@ -1,0 +1,36 @@
+# =====================================================================================
+# Pipeline: blended-plane 3D ICP with 3D-NDT-like maps
+# Variant of lidar3d-ndt.yaml: the point-to-plane matcher is replaced by
+# mp2p_icp::Matcher_NDT_Blend, which blends the neighboring cell Gaussians
+# instead of selecting the closest one. Everything else is identical, and
+# the shipped default temperature of 0 reproduces lidar3d-ndt.yaml exactly.
+# =====================================================================================
+
+$import: lidar3d-ndt.yaml
+
+icp_settings_with_vel:
+  matchers:
+    - class: mp2p_icp::Matcher_NDT_Blend
+      params:
+        distanceThreshold: "1.0*ADAPTIVE_THRESHOLD_SIGMA"
+        # 0 reproduces Matcher_Point2Plane exactly (see lidar3d-ndt.yaml).
+        # Larger values blend the neighboring cell Gaussians instead of keeping
+        # the closest one, which makes the residual a smooth function of the
+        # pose at the price of a less local plane model.
+        temperature: "${MOLA_NDT_BLEND_TEMPERATURE|0.0}"
+        # Blending window, measured to each cell centroid. Tied to the map's own
+        # cell size, since below it no neighboring cell can contribute at all:
+        searchRadius: "${MOLA_NDT_BLEND_SEARCH_RADIUS|max(0.5, min(2.5, 0.75*ESTIMATED_OBSERVATION_RADIUS))}"
+        smoothCutoff: ${MOLA_NDT_BLEND_SMOOTH_CUTOFF|true}
+        allowMatchAlreadyMatchedGlobalPoints: true # faster
+        pointLayerMatches:
+          - { global: "localmap", local: "decimated_for_icp", weight: 1.0 }
+
+    - class: mp2p_icp::Matcher_Points_DistanceThreshold
+      params:
+        threshold: "2.0*max(ADAPTIVE_THRESHOLD_SIGMA, 2.0*ADAPTIVE_THRESHOLD_SIGMA-(2.0*ADAPTIVE_THRESHOLD_SIGMA-0.5*ADAPTIVE_THRESHOLD_SIGMA)*ICP_ITERATION/30)"
+        thresholdAngularDeg: 0 # deg
+        pairingsPerPoint: 1
+        allowMatchAlreadyMatchedGlobalPoints: true # faster
+        pointLayerMatches:
+          - { global: "localmap", local: "decimated_for_icp", weight: 1.0 }

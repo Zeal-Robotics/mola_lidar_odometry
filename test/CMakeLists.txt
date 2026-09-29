@@ -9,8 +9,17 @@ target_link_libraries(test_gravity_map_aligner mola::mola_lidar_odometry)
 ament_add_gtest(test_keyframe_decider test_keyframe_decider.cpp)
 target_link_libraries(test_keyframe_decider mola::mola_lidar_odometry)
 
+ament_add_gtest(test_map_frame_relevel test_map_frame_relevel.cpp)
+target_link_libraries(test_map_frame_relevel mola::mola_lidar_odometry mrpt::mrpt_obs)
+
 ament_add_gtest(test_imu_scan_sync test_imu_scan_sync.cpp)
-target_link_libraries(test_imu_scan_sync mola::mola_lidar_odometry mrpt::obs)
+target_link_libraries(test_imu_scan_sync mola::mola_lidar_odometry mrpt::mrpt_obs)
+
+# Every shipped pipeline, with its blocks, must resolve to a complete config:
+ament_add_gtest(test_pipelines_load test_pipelines_load.cpp
+  ENV LO_PIPELINES_DIR=${mola_lidar_odometry_SOURCE_DIR}/pipelines
+)
+target_link_libraries(test_pipelines_load mola::mola_lidar_odometry mola::mola_yaml)
 
 # -----------------------------------------------------------------------
 # Data-dependent integration tests (require optional packages):
@@ -19,6 +28,22 @@ find_package(mola_test_datasets)
 find_package(mola_metric_maps)
 find_package(mola_input_rosbag2)
 find_package(mola_state_estimation_simple)
+
+# Test: relocalization requests. Reads no dataset, so it is gated only on what
+# it does need: the metric maps the LO pipeline instantiates, and a state
+# estimator for LO to attach to.
+# ------------------------------------------------------------------------------
+if(mola_metric_maps_FOUND AND mola_state_estimation_simple_FOUND)
+  ament_add_gtest(test_relocalization_request test_relocalization_request.cpp
+    ENV LO_PIPELINE_YAML=${mola_lidar_odometry_SOURCE_DIR}/pipelines/lidar3d-default.yaml
+    ENV LO_STATE_ESTIM_YAML=${mola_lidar_odometry_SOURCE_DIR}/state-estimator-params/state-estimation-simple.yaml
+    ENV MOLA_PROFILER=false
+  )
+  target_link_libraries(test_relocalization_request
+    mola::mola_state_estimation_simple
+    mola::mola_lidar_odometry
+  )
+endif()
 
 if((NOT mola_test_datasets_FOUND) OR
    (NOT mola_metric_maps_FOUND) OR
@@ -56,7 +81,7 @@ ament_add_gtest(test_lidar_odometry_kitti test_lidar_odometry_rawlog.cpp
   ENV MOLA_PROFILER=false
 )
 target_link_libraries(test_lidar_odometry_kitti
-  mrpt::obs
+  mrpt::mrpt_obs
   mola::mola_state_estimation_simple
   mola::mola_lidar_odometry
   mola::mola_state_estimation_simple
@@ -80,7 +105,7 @@ ament_add_gtest(test_lidar_odometry_mulran test_lidar_odometry_rawlog.cpp
   ENV MOLA_PROFILER=false
 )
 target_link_libraries(test_lidar_odometry_mulran
-  mrpt::obs
+  mrpt::mrpt_obs
   mola::mola_state_estimation_simple
   mola::mola_lidar_odometry
   mola::mola_state_estimation_simple
@@ -94,7 +119,7 @@ set(RSLIDAR_DATASET_FILE "${mola_test_datasets_DIR}/../datasets/rslidar_warehous
 set(RSLIDAR_GT_TUM ${mola_lidar_odometry_SOURCE_DIR}/test/rslidar_fragment_gt.tum)
 set(RSLIDAR_TOPIC "/rslidar_points")
 
-if(${mrpt-ros2bridge_VERSION} VERSION_GREATER_EQUAL "2.13.5")
+if(${mrpt_libros_bridge_VERSION} VERSION_GREATER_EQUAL "2.13.5")
   set(IGNORE_POINT_STAMPS "false")  # this was a bug fixed in 2.13.5, don't make this pkg to fail
 else()
   set(IGNORE_POINT_STAMPS "true")
@@ -112,7 +137,7 @@ if(EXISTS "${RSLIDAR_DATASET_FILE}")
     MOLA_IGNORE_NO_POINT_STAMPS=${IGNORE_POINT_STAMPS} # make it fail if no timestamps are found
   )
   target_link_libraries(test_lidar_odometry_rslidar
-    mrpt::obs
+    mrpt::mrpt_obs
     mola::mola_lidar_odometry
     mola::mola_input_rosbag2
     mola::mola_state_estimation_simple

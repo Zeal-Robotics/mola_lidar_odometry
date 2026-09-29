@@ -25,8 +25,18 @@ params:
   # These sensor labels will be handled as GNSS (GPS) (For storage in simplemap only)
   gnss_sensor_label: "gps"
 
+  # If not empty, de-skew with this odometry source's velocity over each
+  # sweep (e.g. leg or wheel odometry) instead of the state estimator's, which
+  # is derived from this odometry's own registrations:
+  deskew_odometry_sensor_label: "${MOLA_DESKEW_ODOMETRY_NAME|}"
+
   # Optionally, drop lidar data too close in time:
   min_time_between_scans: 1e-3 # [seconds]
+
+  # Whether a scan arriving while the worker is still busy replaces the one
+  # already queued (real-time behavior) or waits for it (lossless). Set to false
+  # for offline batch runs, where every scan must be processed.
+  drop_stale_scans: ${MOLA_DROP_STALE_SCANS|true}
 
   # Parameters for max sensor range automatic estimation:
   observation_radius_filter_coefficient: 0.999
@@ -49,6 +59,10 @@ params:
     max_distance_to_keep_keyframes: "max(100.0, 1.50*ESTIMATED_OBSERVATION_RADIUS)" # [m]
     check_for_removal_every_n: 100
     min_nearby_poses_occupied: ${MOLA_MIN_NEARBY_POSES_OCCUPIED|1}
+    # Publishing deep-copies the whole local map and does not check for
+    # subscribers, so a batch run pays for it with nobody listening. The
+    # offline CLI defaults this off; a live node should leave it on.
+    publish_local_map: ${MOLA_PUBLISH_LOCAL_MAP|true}
 
   # Minimum ICP quality to insert it into the map:
   min_icp_goodness: 0.25
@@ -174,7 +188,7 @@ icp_settings_with_vel:
       params:
         maxIterations: 2
         robustKernel: "RobustKernel::GemanMcClure"
-        robustKernelParam: "0.50*ADAPTIVE_THRESHOLD_SIGMA" # [m]  # (adaptive)
+        robustKernelScale: "sqrt(0.50*ADAPTIVE_THRESHOLD_SIGMA)" # (adaptive) sqrt() keeps the value this was tuned at
         # Blend [0,1] for the robust kernel residual reference toward the prior
         # mean pose (0=current iterate only, 1=prior mean only). See mp2p_icp.
         robustKernelPriorRefBlend: "${MOLA_LO_ROBUST_KERNEL_PRIOR_REF_BLEND|0.0}"

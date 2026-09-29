@@ -21,8 +21,9 @@ project(mola_lidar_odometry LANGUAGES CXX)
 find_package(mola_common REQUIRED)
 
 # find dependencies:
-find_package(mrpt-maps REQUIRED)
+find_package(mrpt_maps REQUIRED)
 find_package(CLI11 REQUIRED)
+find_package(Eigen3 REQUIRED NO_MODULE)
 find_package(mola_kernel REQUIRED)
 find_package(mola_yaml REQUIRED)
 find_package(mp2p_icp REQUIRED)
@@ -36,6 +37,7 @@ set(LIB_SRCS
   module/src/GravityMapAligner.cpp
   module/src/KeyframeDecider.cpp
   module/src/LidarOdometry_Main.cpp
+  module/src/MapFrameRelevel.cpp
   module/src/LidarOdometry_Relocalization.cpp
   module/src/LidarOdometry_Parameters.cpp
   module/src/LidarOdometry_Initialize.cpp
@@ -53,27 +55,28 @@ set(LIB_SRCS
 set(LIB_PUBLIC_HDRS
   module/include/mola_lidar_odometry/LidarOdometry.h
   module/include/mola_lidar_odometry/GravityMapAligner.h
+  module/include/mola_lidar_odometry/MapFrameRelevel.h
 )
 
 mola_add_library(
   TARGET ${PROJECT_NAME}
   SOURCES ${LIB_SRCS} ${LIB_PUBLIC_HDRS}
   PUBLIC_LINK_LIBRARIES
-    mrpt::maps
+    mrpt::mrpt_maps
     mola::mola_kernel
     mola::mola_yaml
     mola::mp2p_icp
     mola::mp2p_icp_filters
     mola::mola_pose_list
     mola::mola_imu_preintegration
-# PRIVATE_LINK_LIBRARIES
-#  mrpt::maps
+  PRIVATE_LINK_LIBRARIES
+    Eigen3::Eigen
   CMAKE_DEPENDENCIES
     mola_kernel
     mola_yaml
     mp2p_icp
     mp2p_icp_filters
-    mrpt-maps
+    mrpt_maps
 )
 
 # mola_add_library() expects headers under "ROOT/include", so do this manually here:
@@ -108,13 +111,14 @@ find_package(mola_input_rosbag2) # optional
 find_package(mola_input_rosbag1) # optional
 find_package(mola_input_paris_luco_dataset) # optional
 find_package(mola_state_estimation_simple QUIET) # optional
+find_package(mola_state_estimation_smoother QUIET) # optional
 
 mola_add_executable(
   TARGET  mola-lidar-odometry-cli
   SOURCES apps/mola-lidar-odometry-cli.cpp
   LINK_LIBRARIES
   ${PROJECT_NAME}
-  mrpt::maps
+  mrpt::mrpt_maps
   CLI11::CLI11
 )
 target_compile_definitions(mola-lidar-odometry-cli PRIVATE MOLA_LO_VERSION=\"${MY_VERSION}\")
@@ -125,6 +129,48 @@ if(mola_state_estimation_simple_FOUND)
   target_compile_definitions(mola-lidar-odometry-cli PRIVATE HAVE_MOLA_SE_SIMPLE)
 else()
   message(STATUS "mola-lidar-odometry-cli: With mola_state_estimation_simple = NO")
+endif()
+
+# Not selected as a default/fallback estimator like mola_state_estimation_simple
+# above (no HAVE_MOLA_SE_SMOOTHER define needed for that): linking it in is
+# what's required so its class is registered with MRPT's RTTI and therefore
+# reachable via the CLI's own --state-estimator <classname> flag
+# (mrpt::rtti::classFactory() finds any class whose translation unit is
+# actually linked into the binary, generic mechanism, no compile-time
+# branching needed on the caller's side). Without this, --state-estimator
+# mola::state_estimation_smoother::StateEstimationSmoother fails at runtime
+# with "Apparently unknown class name ... (missing plugin .so file?)" even
+# though the flag itself is accepted -- found running the first-ever
+# offline+smoother (cfg-02) sweep through this pipeline, 2026-08-11.
+if(mola_state_estimation_smoother_FOUND)
+  message(STATUS "mola-lidar-odometry-cli: With mola_state_estimation_smoother = YES")
+  # mola_state_estimation_smoother's exported target only records its GTSAM
+  # link dependency by bare name (CMake's legacy
+  # IMPORTED_LINK_DEPENDENT_LIBRARIES mechanism, not a namespaced imported
+  # target), so the gtsam/gtsam_unstable targets it references must already
+  # exist in THIS scope too, or the final link fails with "cannot find
+  # -lgtsam" despite the .so already carrying its own GTSAM dependency
+  # privately. find_package(GTSAM) here is what defines them.
+  find_package(GTSAM QUIET)
+  find_package(GTSAM_UNSTABLE QUIET)
+  # --no-as-needed around this one: nothing in this CLI's own source
+  # references a symbol from mola_state_estimation_smoother directly (its
+  # class is only ever reached indirectly, by name, through
+  # mrpt::rtti::classFactory() at runtime -- unlike
+  # mola_state_estimation_simple above, which IS called directly as a
+  # compile-time fallback and so survives linking as-is). Without this, the
+  # default --as-needed linker behavior sees no referenced symbol and drops
+  # the .so from the binary's DT_NEEDED entries entirely, silently
+  # reproducing the exact "missing plugin .so file?" runtime error this
+  # whole block exists to fix -- confirmed via ldd, which showed the
+  # smoother absent even after the .so linked and built without error.
+  target_link_libraries(mola-lidar-odometry-cli
+    "-Wl,--no-as-needed"
+    mola::mola_state_estimation_smoother
+    "-Wl,--as-needed"
+  )
+else()
+  message(STATUS "mola-lidar-odometry-cli: With mola_state_estimation_smoother = NO")
 endif()
 
 if(mola_input_kitti_dataset_FOUND)
@@ -197,21 +243,53 @@ install(
     share/${PROJECT_NAME}
 )
 
-# Install gui-* demo "executables" too:
+# The per-dataset knowledge behind all the wrappers below. They locate it
+# relative to themselves, so it has to land in share/ under this exact name.
+install(
+  DIRECTORY
+    scripts/lib/
+  DESTINATION
+    share/${PROJECT_NAME}/scripts-lib
+)
+
+# Install the dataset wrappers too. Every dataset gets a "gui" one (online
+# replay through mola-cli) and a "cli" one (offline batch through
+# mola-lidar-odometry-cli); both are thin front-ends over the same profile in
+# scripts-lib/profiles/. Ouster is gui-only: it is a live source, which the
+# offline CLI cannot read.
+set(MOLA_LO_DATASET_WRAPPERS
+    botanicgarden
+    citrusfarm
+    conslam
+    grandtour
+    hilti2022
+    kitti
+    kitti360
+    mulran
+    oxford-spires
+    paris-luco
+    rawlog
+    rosbag1
+    rosbag2
+    # TIERS records five lidars at once, so it gets one wrapper per sensor
+    # rather than one that silently picks a winner:
+    tiers-ouster-os0
+    tiers-ouster-os1
+    tiers-velodyne
+    tiers-livox-horizon
+    tiers-livox-avia
+)
+
+set(MOLA_LO_WRAPPER_PATHS scripts/mola-lo-gui-ouster scripts/mola-lo-gui-ouster-rev8)
+foreach(ds ${MOLA_LO_DATASET_WRAPPERS})
+  list(APPEND MOLA_LO_WRAPPER_PATHS
+       scripts/mola-lo-gui-${ds}
+       scripts/mola-lo-cli-${ds})
+endforeach()
+
 install(
   PROGRAMS
-    scripts/mola-lo-gui-kitti
-    scripts/mola-lo-gui-kitti360
-    scripts/mola-lo-gui-mulran
-    scripts/mola-lo-gui-rawlog
-    scripts/mola-lo-gui-rosbag2
-    scripts/mola-lo-gui-rosbag1
-    scripts/mola-lo-gui-ouster
-    scripts/mola-lo-gui-conslam
-    scripts/mola-lo-gui-oxford-spires
-    scripts/mola-lo-gui-botanicgarden
-    scripts/mola-lo-gui-citrusfarm
-    scripts/mola-lo-gui-grandtour
+    ${MOLA_LO_WRAPPER_PATHS}
   DESTINATION
     bin
 )

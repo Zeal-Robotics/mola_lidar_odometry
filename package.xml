@@ -5,7 +5,7 @@
 -->
 <package format="3">
   <name>mola_lidar_odometry</name>
-  <version>3.1.0</version>
+  <version>3.3.0</version>
   <description>LIDAR odometry system based on MOLA and MRPT components</description>
 
   <maintainer email="joseluisblancoc@gmail.com">Jose-Luis Blanco-Claraco</maintainer>
@@ -17,15 +17,17 @@
   <!-- core dependencies -->
   <depend>mola_common</depend>
   <depend>mola_kernel</depend>
-  <depend>mola_yaml</depend>
+  <depend version_gte="3.1.0">mola_yaml</depend>
   <depend>mp2p_icp</depend>
   <depend>mola_pose_list</depend>
 
   <depend>cli11</depend>
-  <depend>mrpt_libmaps</depend>
+  <depend>mrpt_maps</depend>
+  <build_depend>eigen</build_depend>
 
   <!-- dataset input sources (all are actually optional) -->
   <depend>mola_input_rawlog</depend>
+  <depend>mola_input_rosbag1</depend>
   <depend>mola_input_rosbag2</depend>
 
   <!-- mola_input_rosbag1 is genuinely optional (unlike the ones above, not yet
@@ -51,16 +53,20 @@
   <test_depend>ament_cmake_xmllint</test_depend>
   <test_depend>ament_lint_cmake</test_depend>
   <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>mrpt_obs</test_depend>
   
   <!-- for C++ unit tests -->
   <!-- <test_depend>mola_state_estimation_simple</test_depend> -->
   <!-- for it to be detected and used as default s.e. in the cli -->
   <depend>mola_state_estimation_simple</depend>
+  <!-- for it to be selectable via the cli's state estimator flag -->
+  <depend>mola_state_estimation_smoother</depend>
   <depend>mola_imu_preintegration</depend>
 
   <!-- Needed by the mola-lo-* scripts: -->
   <exec_depend>mola_launcher</exec_depend>
   <exec_depend>mola_viz</exec_depend>
+  <exec_depend>mola_viz_imgui</exec_depend>
   <exec_depend>mola_bridge_ros2</exec_depend>
 
   <!-- Test datasets to run on them: -->

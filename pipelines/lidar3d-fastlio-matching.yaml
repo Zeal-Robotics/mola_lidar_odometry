@@ -1,0 +1,36 @@
+# =====================================================================================
+# Pipeline: MOLA-LO with Fast-LIO2's matching protocol
+#
+# Map, deskew, state estimator, solver and dataset handling are untouched; only
+# the correspondence rule is replaced, by mp2p_icp::Matcher_Points_KnnPlane, and
+# the adaptive-threshold controller is switched off.
+# =====================================================================================
+
+$import: lidar3d-gicp.yaml
+
+params:
+  pipeline_name: "MOLA-LO with Fast-LIO2 k-NN plane matching" # For display/debug only
+
+  adaptive_threshold:
+    # Off by design: this pipeline exists to remove the feedback path from the
+    # registration's own quality back into the matching window.
+    enabled: ${MOLA_ADAPTIVE_THRESHOLD_ENABLED|false}
+
+icp_settings_with_vel:
+  matchers:
+    - class: mp2p_icp::Matcher_Points_KnnPlane
+      params:
+        # Every value below is a constant or a function of a static property of
+        # the measurement. None of them reads back the registration's own
+        # quality, which is the whole point of this pipeline.
+        knn: ${MOLA_KNN|5}
+        maxNeighborDistance: ${MOLA_KNN_MAX_NEIGHBOR_DIST|2.236} # [m]
+        planeFitMaxDeviation: ${MOLA_KNN_PLANE_MAX_DEV|0.1} # [m]
+        residualGateScale: ${MOLA_KNN_RESIDUAL_SCALE|0.9}
+        residualGateAccept: ${MOLA_KNN_RESIDUAL_ACCEPT|0.9}
+        rangeNormalized: ${MOLA_KNN_RANGE_NORMALIZED|true}
+        allowMatchAlreadyMatchedGlobalPoints: true # faster
+        # "observation" is an empty instance of the local-map class, for the
+        # cov-to-cov matcher; a point matcher takes the decimated cloud itself.
+        pointLayerMatches:
+          - { global: "${MOLA_LOCALMAP_LAYER_NAME|localmap}", local: "decimated_for_icp", weight: 1.0 }
