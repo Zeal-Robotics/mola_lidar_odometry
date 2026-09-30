@@ -17,6 +17,7 @@ $import:
   - ${MOLA_LO_BLOCK_RUNTIME|blocks/runtime.yaml}
   - ${MOLA_LO_BLOCK_ACCEPTANCE|blocks/acceptance.yaml}
   - ${MOLA_LO_BLOCK_ADAPTIVE_THRESHOLD|blocks/adaptive-threshold.yaml}
+  - ${MOLA_LO_BLOCK_POSE_VERIFICATION|blocks/pose-verification.yaml}
   - ${MOLA_LO_BLOCK_SIMPLEMAP|blocks/simplemap.yaml}
   - ${MOLA_LO_BLOCK_VISUALIZATION|blocks/visualization.yaml}
   - ${MOLA_LO_BLOCK_INITIAL_LOCALIZATION|blocks/initial-localization.yaml}

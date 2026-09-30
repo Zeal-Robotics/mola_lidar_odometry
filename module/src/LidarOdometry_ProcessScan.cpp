@@ -1555,6 +1555,12 @@ void LidarOdometry::processLidarScan(  // NOLINT
       state_.last_lidar_pose.copyFrom(state_.last_motion_model_output->pose);
     }
 
+    // An accepted registration at rest is the one worth doubting: a scan that
+    // settled onto the wrong surface passes every test above.
+    if (icpIsGood) {
+      doPoseVerification(*observation, *icpCase.icp, in.icp_params, out.goodness, scan_ref_time);
+    }
+
     // Update velocity model:
     // Snapshot before it gets decremented below, so the map-freeze check
     // further down still sees this step as part of the recovery window.

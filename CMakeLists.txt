@@ -47,6 +47,8 @@ set(LIB_SRCS
   module/src/LidarOdometry_GUI.cpp
   module/src/LidarOdometry_SensorCallbacks.cpp
   module/src/LidarOdometry_Publish.cpp
+  module/src/LidarOdometry_PoseVerification.cpp
+  module/src/PoseVerification.cpp
   module/src/LidarOdometry_InitialLocalization.cpp
   # Last:
   module/src/register.cpp

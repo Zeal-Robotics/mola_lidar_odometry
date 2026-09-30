@@ -135,6 +135,11 @@ void LidarOdometry::shutdownCleanup()
         state_.registrations_attempted, state_.registration_no_motion_model, pctNoModel,
         state_.registration_icp_rejected, pctRejected);
     }
+    if (state_.pose_verification.checks > 0) {
+      MRPT_LOG_INFO_FMT(
+        "Pose verification totals: checks=%zu better_registration_found=%zu",
+        state_.pose_verification.checks, state_.pose_verification.better_found);
+    }
 
     if (params_.simplemap.generate) {
       saveReconstructedMapToFile();

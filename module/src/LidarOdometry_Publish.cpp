@@ -62,8 +62,11 @@ void LidarOdometry::doPublishUpdatedLocalization(const mrpt::Clock::time_point &
   lu.timestamp = scan_ref_time;
   lu.pose = state_.last_lidar_pose.mean.asTPose();
   lu.cov = state_.last_lidar_pose.cov;
-  // A pose that did not come from an accepted registration carries no ICP quality:
-  lu.quality = state_.last_pose_from_prediction ? 0.0 : state_.last_icp_quality;
+  // A pose that did not come from an accepted registration carries no ICP quality, and
+  // neither does one the pose verification found a better registration for:
+  const bool trusted =
+    !state_.last_pose_from_prediction && !state_.pose_verification.last_verdict.better_pose_found;
+  lu.quality = trusted ? state_.last_icp_quality : 0.0;
 
   advertiseUpdatedLocalization(lu);
 }
@@ -382,7 +385,37 @@ void LidarOdometry::getDiagnostics(std::vector<mola::DiagnosticStatusMsg> & stat
     status.push_back(std::move(s));
   }
 
-  // 3) Timing
+  // 3) Pose verification
+  if (params_.pose_verification.enabled) {
+    mola::DiagnosticStatusMsg s;
+    s.name = "LidarOdometry: Pose Verification";
+    const auto & pv = state_.pose_verification;
+    if (!pv.last_stamp) {
+      s.level = L::STALE;
+      s.message = "Not verified yet";
+    } else if (pv.last_verdict.better_pose_found) {
+      s.level = L::ERROR;
+      s.message = "A better registration exists near the accepted pose";
+    } else {
+      s.level = L::OK;
+      s.message = "Accepted pose confirmed";
+    }
+    if (pv.last_stamp) {
+      s.values.push_back(kv_d("age_sec", mrpt::system::timeDifference(*pv.last_stamp, now)));
+      s.values.push_back(kv_d("resting_quality", pv.last_resting_quality));
+      s.values.push_back(kv_u("distinct_registrations", pv.last_verdict.distinct));
+      if (pv.last_verdict.best_distinct) {
+        const auto & b = *pv.last_verdict.best_distinct;
+        s.values.push_back(kv_d("best_distinct_quality", b.quality));
+        s.values.push_back({"best_distinct_pose", b.pose.asString()});
+      }
+    }
+    s.values.push_back(kv_u("checks", pv.checks));
+    s.values.push_back(kv_u("better_found", pv.better_found));
+    status.push_back(std::move(s));
+  }
+
+  // 4) Timing
   {
     mola::DiagnosticStatusMsg s;
     s.name = "LidarOdometry: Timing";
@@ -400,7 +433,7 @@ void LidarOdometry::getDiagnostics(std::vector<mola::DiagnosticStatusMsg> & stat
     status.push_back(std::move(s));
   }
 
-  // 4) Local Map (informational)
+  // 5) Local Map (informational)
   {
     mola::DiagnosticStatusMsg s;
     s.name = "LidarOdometry: Local Map";
@@ -421,7 +454,7 @@ void LidarOdometry::getDiagnostics(std::vector<mola::DiagnosticStatusMsg> & stat
     status.push_back(std::move(s));
   }
 
-  // 5) Overall status: worst-of the entries added by this provider
+  // 6) Overall status: worst-of the entries added by this provider
   {
     mola::DiagnosticStatusMsg s;
     s.name = "LidarOdometry: Overall Status";

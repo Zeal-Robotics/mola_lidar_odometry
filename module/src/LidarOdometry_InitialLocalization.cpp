@@ -56,6 +56,11 @@ void LidarOdometry::handleInitialLocalizationDoInitFromPose(
 
   // also, keep it as the last pose for subsequent ICP runs:
   state_.last_lidar_pose = initPose;
+
+  // A new pose is a new claim to verify; whatever the last verification found
+  // about the old one no longer applies.
+  state_.pose_verification.scheduler.reset();
+  state_.pose_verification.last_verdict = {};
 }
 
 void LidarOdometry::handleInitialLocalization()

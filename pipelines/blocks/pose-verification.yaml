@@ -1,0 +1,37 @@
+# =====================================================================================
+# Pipeline block: standstill pose verification
+#
+# Shared by the pipelines/*.yaml files through `$import`. See the
+# "Pipeline blocks" section in the docs for how to override it.
+# =====================================================================================
+
+params:
+  # A registration can be self-consistent and still be wrong: on a map with
+  # repeated structure, ICP settles onto a nearby surface that is not the one
+  # the vehicle is on, with a quality that reads as fine, and every scan after
+  # that confirms it because the search radius never reaches the true pose.
+  # While the vehicle rests, ICP is started again from a ring of guesses
+  # around the accepted pose. If one settles somewhere else with a clearly
+  # better quality, the published quality drops to 0 until a later
+  # verification passes or a relocalization arrives, and the diagnostics
+  # carry the better pose.
+  pose_verification:
+    enabled: ${MOLA_POSE_VERIFICATION|false}
+    # The pose rests when it stays within these bounds for still_seconds:
+    still_translation: 0.30 # [m]
+    still_rotation_deg: 3.0
+    still_seconds: ${MOLA_POSE_VERIFICATION_STILL_SECONDS|2.0}
+    # Each rest is verified once when it starts, then again this often:
+    period_seconds: ${MOLA_POSE_VERIFICATION_PERIOD|30.0}
+    # Guesses on a ring around the accepted pose, in the vehicle frame, at each
+    # yaw offset. The radius must reach past the basin the accepted pose sits in,
+    # of the order of the matcher's search radius (see adaptive_threshold), or
+    # every guess falls straight back into it.
+    ring_radius: ${MOLA_POSE_VERIFICATION_RING_RADIUS|1.0} # [m]
+    ring_directions: 8
+    yaw_offsets_deg: [0.0]
+    # A guess that settles farther than this found a different registration:
+    distinct_translation: 0.5 # [m]
+    distinct_rotation_deg: 5.0
+    # It counts as better only when it beats the accepted quality by this much:
+    quality_margin: ${MOLA_POSE_VERIFICATION_QUALITY_MARGIN|0.05}

@@ -361,6 +361,10 @@ reaches every pipeline at once.
      - ``MOLA_LO_BLOCK_ADAPTIVE_THRESHOLD``
      - Adaptive matching threshold controller
      - all 3D
+   * - ``pose-verification.yaml``
+     - ``MOLA_LO_BLOCK_POSE_VERIFICATION``
+     - Standstill re-registration from a ring of guesses, reporting a better registration than the accepted one (off by default)
+     - all 3D
    * - ``simplemap.yaml``
      - ``MOLA_LO_BLOCK_SIMPLEMAP``
      - Keyframe map (simplemap) generation

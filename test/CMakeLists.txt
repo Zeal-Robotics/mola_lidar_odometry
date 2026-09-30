@@ -9,6 +9,9 @@ target_link_libraries(test_gravity_map_aligner mola::mola_lidar_odometry)
 ament_add_gtest(test_keyframe_decider test_keyframe_decider.cpp)
 target_link_libraries(test_keyframe_decider mola::mola_lidar_odometry)
 
+ament_add_gtest(test_pose_verification test_pose_verification.cpp)
+target_link_libraries(test_pose_verification mola::mola_lidar_odometry)
+
 ament_add_gtest(test_map_frame_relevel test_map_frame_relevel.cpp)
 target_link_libraries(test_map_frame_relevel mola::mola_lidar_odometry mrpt::mrpt_obs)
 

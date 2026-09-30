@@ -56,6 +56,7 @@
 #include <mola_lidar_odometry/ImuScanSync.h>
 #include <mola_lidar_odometry/KeyframeDecider.h>
 #include <mola_lidar_odometry/MapFrameRelevel.h>
+#include <mola_lidar_odometry/PoseVerification.h>
 
 /** Feature macro: the one-off map-frame gauge change is available.
  *
@@ -546,6 +547,10 @@ public:
       void initialize(const Yaml & c);
     };
     AdaptiveThreshold adaptive_threshold;
+
+    /** Standstill check that the accepted pose is the best registration
+     *  nearby, see PoseVerificationOptions. */
+    PoseVerificationOptions pose_verification;
 
     /** Thresholds for REP-107 diagnostics levels. */
     struct Diagnostics
@@ -1394,6 +1399,20 @@ private:
     bool last_pose_from_prediction = false;
     std::size_t last_icp_iterations = 0;
 
+    /// The standstill pose verification: when it runs, and what it last found.
+    /// A verdict that found a better registration holds until a later
+    /// verification passes or a relocalization arrives.
+    struct PoseVerificationState
+    {
+      PoseVerificationScheduler scheduler;
+      std::optional<mrpt::Clock::time_point> last_stamp;
+      double last_resting_quality = 0;
+      PoseVerificationVerdict last_verdict;
+      size_t checks = 0;
+      size_t better_found = 0;
+    };
+    PoseVerificationState pose_verification;
+
     std::optional<mrpt::Clock::time_point> first_ever_timestamp;
     std::optional<mrpt::Clock::time_point> last_obs_timestamp;
     std::optional<mrpt::Clock::time_point> last_icp_timestamp;
@@ -1864,6 +1883,15 @@ private:
 
   // Adaptive threshold method:
   void doUpdateAdaptiveThreshold();
+
+  /** Runs the standstill pose verification when one is due, re-registering
+   *  `observation` against the local map from guesses around the accepted
+   *  pose with the same ICP and parameters the accepted registration used.
+   *  Caller must hold state_mtx_. */
+  void doPoseVerification(
+    const mp2p_icp::metric_map_t & observation, mp2p_icp::ICP & icp,
+    const mp2p_icp::Parameters & icpParams, double restingQuality,
+    const mrpt::Clock::time_point & stamp);
 
   void doInitializeEstimatedObservationRadius(const mrpt::obs::CObservation & o);
   /// Returns false if no layer of `m` had usable points, so nothing was updated.

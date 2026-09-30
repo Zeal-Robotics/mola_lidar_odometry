@@ -27,6 +27,10 @@ MOLA-LO publishes the following ``DiagnosticStatus`` entries on each tick:
   and dropped-frame ratio.
 * **LidarOdometry: ICP Quality** — current ICP quality metric from the last
   scan matching.
+* **LidarOdometry: Pose Verification** — only with ``pose_verification.enabled``:
+  whether the last standstill verification confirmed the accepted pose
+  (``OK``) or found a better registration nearby (``ERROR``, with its pose
+  and quality), or none has run yet (``STALE``).
 * **LidarOdometry: Timing** — processing time utilization (fraction of the
   expected frame period used by the pipeline).
 * **LidarOdometry: Local Map** — local map size and update state
