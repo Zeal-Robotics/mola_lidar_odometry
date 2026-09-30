@@ -33,6 +33,7 @@
 #include <sstream>
 
 // MOLA:
+#include <mola_kernel/PointsMapViewCapable.h>
 #include <mola_kernel/version.h>
 
 // SFINAE to detect for mp2p_icp map metadata:
@@ -122,7 +123,7 @@ void LidarOdometry::doPublishUpdatedLocalMap(const mrpt::Clock::time_point & sca
       mu.map = mapCopy;
     }
     // any other map with a points-map representation:
-    else if (const auto * auxPts = mrpt::maps::asPointsMap(*layerMap); auxPts) {
+    else if (const auto * auxPts = mola::asPointsMap(*layerMap); auxPts) {
       auto mapCopy = mrpt::maps::CSimplePointsMap::Create();
       mapCopy->insertAnotherMap(auxPts, mrpt::poses::CPose3D::Identity());
 
