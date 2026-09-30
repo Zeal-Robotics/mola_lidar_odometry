@@ -98,6 +98,11 @@ modules:
       # If enabled, during spinOnce(), the tf ``${odom_frame} => ${base_link_frame}`` will
       # be queried and forwarded as an `CObservationOdometry` reading to the MOLA subsystem:
       forward_ros_tf_as_mola_odometry_observations: ${MOLA_FORWARD_ROS_TF_ODOM_TO_MOLA|false}
+      # How a subscribed nav_msgs/Odometry topic reaches the state estimator: as an SE(3)
+      # pose in its own frame carrying the message's covariance (true), or as wheel odometry
+      # whose increments the estimator weighs with its own motion model (false). Wheel
+      # odometry that publishes a nominal covariance belongs on the second path.
+      odometry_as_robot_pose_observation: ${MOLA_ODOM_AS_ROBOT_POSE|true}
 
       # If enabled, SLAM/Localization results will be published as nav_msgs/Odometry messages.
       publish_odometry_msgs_from_slam: ${MOLA_LOCALIZATION_PUBLISH_ODOM_MSGS|true}
