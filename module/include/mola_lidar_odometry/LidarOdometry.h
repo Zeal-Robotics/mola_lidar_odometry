@@ -1410,6 +1410,10 @@ private:
       PoseVerificationVerdict last_verdict;
       size_t checks = 0;
       size_t better_found = 0;
+      /// Bumped by a relocalization. A verification that was started under an
+      /// older generation judged a pose that no longer stands, so its verdict
+      /// is discarded when it arrives.
+      uint64_t generation = 0;
     };
     PoseVerificationState pose_verification;
 
@@ -1743,6 +1747,24 @@ private:
   mrpt::WorkerThreadsPool worker_viz_local_map_{
     1, mrpt::WorkerThreadsPool::POLICY_DROP_OLD, "worker_viz_map"};
 
+  /** Runs the standstill pose verification. Its ring of registrations takes
+   *  several scan periods, so on worker_lidar_ it would have the scans arriving
+   *  meanwhile dropped. One thread, and never more than one verification in
+   *  flight (pose_verification_running_). Same shutdown contract as
+   *  worker_viz_local_map_: its task holds pointers into `*this`, which is
+   *  safe only because shutdownCleanup() waits for it and clears it. */
+  mrpt::WorkerThreadsPool worker_pose_verification_{
+    1, mrpt::WorkerThreadsPool::POLICY_FIFO, "worker_pose_verif"};
+  std::atomic<bool> pose_verification_running_{false};
+
+  /** The verification's own ICP, built from the same pipeline as the regular
+   *  registration. A separate instance with its own parameter source: an ICP
+   *  writes its iteration count into the source it is attached to while it
+   *  runs, so sharing either with worker_lidar_'s registration would have the
+   *  two interfere. */
+  mp2p_icp::ICP::Ptr pose_verification_icp_;
+  mp2p_icp::ParameterSource pose_verification_parameter_source_;
+
   MethodState state_;
   const MethodState & state() const { return state_; }
   MethodState stateCopy() const { return state_; }
@@ -1884,14 +1906,31 @@ private:
   // Adaptive threshold method:
   void doUpdateAdaptiveThreshold();
 
-  /** Runs the standstill pose verification when one is due, re-registering
-   *  `observation` against the local map from guesses around the accepted
-   *  pose with the same ICP and parameters the accepted registration used.
-   *  Caller must hold state_mtx_. */
+  /** Starts the standstill pose verification when one is due: `observation`
+   *  is re-registered against the local map from guesses around the accepted
+   *  pose, with the parameters the accepted registration used, on
+   *  worker_pose_verification_. Caller must hold state_mtx_. */
   void doPoseVerification(
-    const mp2p_icp::metric_map_t & observation, mp2p_icp::ICP & icp,
+    const mp2p_icp::metric_map_t::ConstPtr & observation,
     const mp2p_icp::Parameters & icpParams, double restingQuality,
     const mrpt::Clock::time_point & stamp);
+
+  /** What one verification needs, captured under state_mtx_ when it starts so
+   *  the run itself needs no lock on the method state. */
+  struct PoseVerificationJob
+  {
+    mp2p_icp::metric_map_t::ConstPtr observation;
+    mp2p_icp::metric_map_t::Ptr local_map;
+    mp2p_icp::Parameters icp_params;
+    std::map<std::string, double> icp_variables;
+    mrpt::poses::CPose3D resting;
+    double resting_quality = 0;
+    mrpt::Clock::time_point stamp;
+    uint64_t generation = 0;
+  };
+
+  /// Runs one verification on worker_pose_verification_ and records its verdict.
+  void runPoseVerification(const PoseVerificationJob & job);
 
   void doInitializeEstimatedObservationRadius(const mrpt::obs::CObservation & o);
   /// Returns false if no layer of `m` had usable points, so nothing was updated.

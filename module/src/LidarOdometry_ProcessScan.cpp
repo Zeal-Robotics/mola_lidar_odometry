@@ -1558,7 +1558,7 @@ void LidarOdometry::processLidarScan(  // NOLINT
     // An accepted registration at rest is the one worth doubting: a scan that
     // settled onto the wrong surface passes every test above.
     if (icpIsGood) {
-      doPoseVerification(*observation, *icpCase.icp, in.icp_params, out.goodness, scan_ref_time);
+      doPoseVerification(observation, in.icp_params, out.goodness, scan_ref_time);
     }
 
     // Update velocity model:

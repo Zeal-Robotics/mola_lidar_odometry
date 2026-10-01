@@ -61,6 +61,7 @@ void LidarOdometry::handleInitialLocalizationDoInitFromPose(
   // about the old one no longer applies.
   state_.pose_verification.scheduler.reset();
   state_.pose_verification.last_verdict = {};
+  state_.pose_verification.generation++;
 }
 
 void LidarOdometry::handleInitialLocalization()

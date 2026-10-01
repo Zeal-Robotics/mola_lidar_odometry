@@ -350,6 +350,13 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
         mp2p_icp_filters::apply_filter_pipeline(state_.pc_filter3, m, profiler_);
       };
     }
+    if (params_.pose_verification.enabled) {
+      const auto [icp, params] = mp2p_icp::icp_pipeline_from_yaml(c["icp_settings_with_vel"]);
+      (void)params;
+      pose_verification_icp_ = icp;
+      pose_verification_icp_->attachToParameterSource(pose_verification_parameter_source_);
+    }
+
     // system-wide profiler:
     profiler_.enable(params_.pipeline_profiler_enabled);
 

@@ -119,6 +119,7 @@ void LidarOdometry::shutdownCleanup()
     worker_others_.clear();
     worker_viz_.clear();
     worker_viz_local_map_.clear();
+    worker_pose_verification_.clear();
 
     // Run totals, once, in a form a harness can scrape. `no_motion_model` is
     // the number the corpus had no aggregate for: it is the difference between
@@ -287,7 +288,8 @@ bool LidarOdometry::isBusy() const
   is_busy_mtx_.lock();
   b = (state_.worker_tasks_lidar != 0) || (state_.worker_tasks_others != 0);
   is_busy_mtx_.unlock();
-  return b || worker_lidar_.pendingTasks() != 0 || worker_others_.pendingTasks() != 0;
+  return b || worker_lidar_.pendingTasks() != 0 || worker_others_.pendingTasks() != 0 ||
+         pose_verification_running_;
 }
 
 bool LidarOdometry::isActive() const
