@@ -1410,10 +1410,6 @@ private:
       PoseVerificationVerdict last_verdict;
       size_t checks = 0;
       size_t better_found = 0;
-      /// Bumped by a relocalization. A verification that was started under an
-      /// older generation judged a pose that no longer stands, so its verdict
-      /// is discarded when it arrives.
-      uint64_t generation = 0;
     };
     PoseVerificationState pose_verification;
 
@@ -1757,13 +1753,24 @@ private:
     1, mrpt::WorkerThreadsPool::POLICY_FIFO, "worker_pose_verif"};
   std::atomic<bool> pose_verification_running_{false};
 
+  /** Bumped whenever the pose a verification would judge stops standing: a
+   *  relocalization, a reset, a map load. A verdict from an older generation
+   *  is discarded when it arrives. Outside MethodState so a reset cannot
+   *  rewind it. */
+  std::atomic<uint64_t> pose_verification_generation_{0};
+
   /** The verification's own ICP, built from the same pipeline as the regular
-   *  registration. A separate instance with its own parameter source: an ICP
-   *  writes its iteration count into the source it is attached to while it
-   *  runs, so sharing either with worker_lidar_'s registration would have the
-   *  two interfere. */
-  mp2p_icp::ICP::Ptr pose_verification_icp_;
-  mp2p_icp::ParameterSource pose_verification_parameter_source_;
+   *  registration, and the parameter source it is attached to. An ICP writes
+   *  its iteration count into its source while it runs, so sharing either with
+   *  worker_lidar_'s registration would have the two interfere. The two live
+   *  and die together, and a running verification holds its own reference, so
+   *  re-initializing leaves it nothing dangling. */
+  struct PoseVerificationIcp
+  {
+    mp2p_icp::ParameterSource parameter_source;
+    mp2p_icp::ICP::Ptr icp;
+  };
+  std::shared_ptr<PoseVerificationIcp> pose_verification_icp_;
 
   MethodState state_;
   const MethodState & state() const { return state_; }
@@ -1919,6 +1926,7 @@ private:
    *  the run itself needs no lock on the method state. */
   struct PoseVerificationJob
   {
+    std::shared_ptr<PoseVerificationIcp> icp;
     mp2p_icp::metric_map_t::ConstPtr observation;
     mp2p_icp::metric_map_t::Ptr local_map;
     mp2p_icp::Parameters icp_params;

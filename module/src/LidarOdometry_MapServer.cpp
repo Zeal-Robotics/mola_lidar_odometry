@@ -95,6 +95,10 @@ MapServer::ReturnStatus LidarOdometry::map_load_impl(const std::string & path)
 
     ASSERT_(state_.local_map);
     state_.local_map->clear();
+    // A verification in flight judged a pose in the map this replaces:
+    pose_verification_generation_++;
+    state_.pose_verification.scheduler.reset();
+    state_.pose_verification.last_verdict = {};
     state_.gravity_calib_pitch_roll.reset();  // new map origin: recapture at next first KF
     state_.gravity_calib_pose.reset();
     state_.gravity_calib_first_available_time.reset();

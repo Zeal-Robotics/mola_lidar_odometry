@@ -39,6 +39,7 @@ void LidarOdometry::doPoseVerification(
   }
 
   PoseVerificationJob job;
+  job.icp = pose_verification_icp_;
   job.observation = observation;
   job.local_map = state_.local_map;
   job.icp_params = icpParams;
@@ -49,17 +50,25 @@ void LidarOdometry::doPoseVerification(
   job.resting = state_.last_lidar_pose.mean;
   job.resting_quality = restingQuality;
   job.stamp = stamp;
-  job.generation = pv.generation;
+  job.generation = pose_verification_generation_;
 
   pv.scheduler.done(t);
   pose_verification_running_ = true;
   (void)worker_pose_verification_.enqueue([this, job]() {
+    // Cleared however the run ends: shutdown waits on this flag.
+    struct ClearOnExit
+    {
+      std::atomic<bool> & flag;
+      ~ClearOnExit() { flag = false; }
+    };
+    const ClearOnExit cleared{pose_verification_running_};
     try {
       runPoseVerification(job);
     } catch (const std::exception & e) {
       MRPT_LOG_ERROR_FMT("Pose verification failed: %s", e.what());
+    } catch (...) {
+      MRPT_LOG_ERROR("Pose verification failed with an unknown exception");
     }
-    pose_verification_running_ = false;
   });
 }
 
@@ -67,23 +76,26 @@ void LidarOdometry::runPoseVerification(const PoseVerificationJob & job)
 {
   const ProfilerEntry tle(profiler_, "pose_verification");
   const auto & o = params_.pose_verification;
+  const double startTime = mrpt::Clock::nowDouble();
 
   for (const auto & [name, value] : job.icp_variables) {
-    pose_verification_parameter_source_.updateVariable(name, value);
+    job.icp->parameter_source.updateVariable(name, value);
   }
-  pose_verification_parameter_source_.realize();
+  job.icp->parameter_source.realize();
 
   std::vector<PoseVerificationCandidate> candidates;
-  {
-    // The registration reads the local map while worker_lidar_ may be
-    // updating it; the map content mutex is what excludes the two.
+  for (const auto & guess : poseVerificationGuesses(job.resting, o)) {
+    // Excludes a change to the map's contents during a registration, and is
+    // released between guesses so whoever makes one waits for a guess, not the
+    // ring. The scan worker registers against the same map meanwhile, and the
+    // map keeps one ICP search submap, rebuilt for the keyframes nearest the
+    // initial guess of whichever registration asked last. That is sound only
+    // while both select the same keyframes, which a loaded localization map,
+    // one keyframe, guarantees; the verification is off while mapping.
     auto lckMapContents = mrpt::lockHelper(local_map_content_mtx_);
-    for (const auto & guess : poseVerificationGuesses(job.resting, o)) {
-      mp2p_icp::Results r;
-      pose_verification_icp_->align(
-        *job.observation, *job.local_map, guess.asTPose(), job.icp_params, r);
-      candidates.push_back({r.optimal_tf.mean, r.quality, static_cast<uint32_t>(r.nIterations)});
-    }
+    mp2p_icp::Results r;
+    job.icp->icp->align(*job.observation, *job.local_map, guess.asTPose(), job.icp_params, r);
+    candidates.push_back({r.optimal_tf.mean, r.quality, static_cast<uint32_t>(r.nIterations)});
   }
 
   const auto verdict = evaluatePoseVerification(
@@ -92,8 +104,8 @@ void LidarOdometry::runPoseVerification(const PoseVerificationJob & job)
   {
     auto lck = mrpt::lockHelper(state_mtx_);
     auto & pv = state_.pose_verification;
-    if (pv.generation != job.generation) {
-      MRPT_LOG_INFO("Pose verification: discarded, the vehicle was relocalized meanwhile");
+    if (pose_verification_generation_ != job.generation) {
+      MRPT_LOG_INFO("Pose verification: discarded, the pose it judged was replaced meanwhile");
       return;
     }
     pv.last_verdict = verdict;
@@ -105,25 +117,28 @@ void LidarOdometry::runPoseVerification(const PoseVerificationJob & job)
     }
   }
 
+  const std::string cost = mrpt::format("took %.2f s", mrpt::Clock::nowDouble() - startTime);
+
   if (!verdict.better_pose_found) {
     std::string elsewhere;
     if (verdict.best_distinct) {
       elsewhere = mrpt::format(", best of those %.3f", verdict.best_distinct->quality);
     }
     MRPT_LOG_INFO_FMT(
-      "Pose verification: confirmed at %s (quality %.3f, %zu of %zu guesses settled elsewhere%s)",
+      "Pose verification: confirmed at %s (quality %.3f, %zu of %zu guesses settled elsewhere%s; "
+      "%s)",
       job.resting.asString().c_str(), job.resting_quality, verdict.distinct, candidates.size(),
-      elsewhere.c_str());
+      elsewhere.c_str(), cost.c_str());
     return;
   }
 
   const auto & best = *verdict.best_distinct;
   MRPT_LOG_WARN_FMT(
     "Pose verification: a better registration exists %.2f m from the accepted pose: %s "
-    "(quality %.3f in %u iterations, versus %.3f here). Publishing quality 0 until a later "
+    "(quality %.3f in %u iterations, versus %.3f here; %s). Publishing quality 0 until a later "
     "verification passes or a relocalization arrives.",
     (best.pose - job.resting).translation().norm(), best.pose.asString().c_str(), best.quality,
-    best.iterations, job.resting_quality);
+    best.iterations, job.resting_quality, cost.c_str());
 }
 
 }  // namespace mola

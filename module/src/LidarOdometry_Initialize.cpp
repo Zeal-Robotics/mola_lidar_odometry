@@ -353,8 +353,10 @@ void LidarOdometry::initialize_frontend(const Yaml & c)
     if (params_.pose_verification.enabled) {
       const auto [icp, params] = mp2p_icp::icp_pipeline_from_yaml(c["icp_settings_with_vel"]);
       (void)params;
-      pose_verification_icp_ = icp;
-      pose_verification_icp_->attachToParameterSource(pose_verification_parameter_source_);
+      auto verifier = std::make_shared<PoseVerificationIcp>();
+      verifier->icp = icp;
+      verifier->icp->attachToParameterSource(verifier->parameter_source);
+      pose_verification_icp_ = verifier;
     }
 
     // system-wide profiler:

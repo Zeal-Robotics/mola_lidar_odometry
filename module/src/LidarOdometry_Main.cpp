@@ -243,6 +243,7 @@ void LidarOdometry::reset()
     // thread reaches without state_mtx_:
     auto lckImu = mrpt::lockHelper(imu_state_mtx_);
     state_ = MethodState();
+    pose_verification_generation_++;
     pending_imu_.clear();
     latest_imu_time_ = 0;
     latest_obs_time_ = 0;
