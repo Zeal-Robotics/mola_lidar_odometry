@@ -17,8 +17,10 @@ params:
   # carry the better pose.
   pose_verification:
     enabled: ${MOLA_POSE_VERIFICATION|false}
-    # The pose rests when it stays within these bounds for still_seconds:
-    still_translation: 0.30 # [m]
+    # The pose rests when it stays within these bounds for still_seconds. The
+    # translation bound is above the registration's wander at rest (about 1 cm)
+    # and below what a creeping vehicle covers in still_seconds:
+    still_translation: 0.05 # [m]
     still_rotation_deg: 3.0
     still_seconds: ${MOLA_POSE_VERIFICATION_STILL_SECONDS|2.0}
     # Each rest is verified once when it starts, then again this often:

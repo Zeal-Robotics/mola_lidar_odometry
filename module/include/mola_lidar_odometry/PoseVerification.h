@@ -39,8 +39,11 @@ struct PoseVerificationOptions
   bool enabled = false;
 
   /** The vehicle rests when the accepted pose stays within these bounds of
-   *  where it first came to rest for `still_seconds`. */
-  double still_translation = 0.30;  //!< [m]
+   *  where it first came to rest for `still_seconds`. The translation bound
+   *  sits above how far a registration wanders at rest and below what a
+   *  creeping vehicle covers in `still_seconds`, since a verification costs
+   *  the processing time a moving vehicle needs for its scans. */
+  double still_translation = 0.05;  //!< [m]
   double still_rotation_deg = 3.0;
   double still_seconds = 2.0;
 
