@@ -450,9 +450,11 @@ def generate_launch_description():
             'estimate_geo_reference').perform(context).strip()
         return [SetEnvironmentVariable(name='MOLA_ESTIMATE_GEO_REF', value=v)] if v else []
 
-    # Environment variables that only apply if the smoother is active
+    # Environment variables that only apply if the smoother is active. Unscoped: a scoped group
+    # restores the environment when it ends, which would drop these before mola-cli starts.
     smoother_env_vars = GroupAction(
         condition=IfCondition(LaunchConfiguration('use_state_estimator')),
+        scoped=False,
         actions=[
             SetEnvironmentVariable('MOLA_NAVSTATE_KINEMATIC_MODEL', LaunchConfiguration(
                 'navstate_kinematic_model')),
