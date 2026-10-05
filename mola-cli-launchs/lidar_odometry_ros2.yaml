@@ -110,6 +110,11 @@ modules:
       # If the flag above is true, this allows fine tuning which localization source will be actually forwarded (MOLA module name). Empty=any.
       publish_odometry_msgs_from_slam_source: ${MOLA_LOCALIZATION_PUBLISH_ODOM_MSGS_SOURCE|""} # alternative: 'state_estimation_smoother'
 
+      # If not empty, this source's accepted registrations (updates with a non-zero quality,
+      # never a prediction) are also published on "<source>/registration", whichever source
+      # the odometry messages above follow. E.g. 'lidar_odometry'.
+      publish_registration_msgs_from_slam_source: ${MOLA_LOCALIZATION_PUBLISH_REGISTRATION_SOURCE|""}
+
       # If enabled, SLAM/Localization results will be published as tf messages, for frames
       # according to explained above for `publish_localization_following_rep105`.
       publish_tf_from_slam: ${MOLA_LOCALIZATION_PUBLISH_TF|true}
