@@ -6,6 +6,9 @@
 ament_add_gtest(test_gravity_map_aligner test_gravity_map_aligner.cpp)
 target_link_libraries(test_gravity_map_aligner mola::mola_lidar_odometry)
 
+ament_add_gtest(test_icp_prior test_icp_prior.cpp)
+target_link_libraries(test_icp_prior mola::mola_lidar_odometry)
+
 ament_add_gtest(test_keyframe_decider test_keyframe_decider.cpp)
 target_link_libraries(test_keyframe_decider mola::mola_lidar_odometry)
 

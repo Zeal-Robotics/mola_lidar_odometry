@@ -246,6 +246,14 @@ For OFFLINE / reproducible batch runs set `MOLA_ASYNC_BACKEND=false` (async
 serving is non-deterministic). Full parameter table: `mola_state_estimation`'s
 AGENTS.md ("Real-time setup").
 
+The estimator pose is in the `[x y z yaw pitch roll]` layout of
+`CPose3DPDFGaussianInf`, but the ICP solver applies its prior information in the
+SE(3) tangent of the prior mean (see `IcpPrior.h`). Build the ICP prior with
+`icp_prior_from_motion_model()` and move its mean only with
+`set_icp_prior_mean()`, which re-expresses the information at the new mean;
+entries written straight into `in.prior->cov_inv` (SE(2), gravity) are tangent
+indices: [3]=w_x (~roll), [4]=w_y (~pitch), [5]=w_z (~yaw).
+
 ### REP-105 `map -> odom` published directly (jitter-free)
 
 By default, under `publish_localization_following_rep105: true` the bridge
